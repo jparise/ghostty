@@ -109,6 +109,8 @@ pub const Cursor = struct {
     /// our style when used.
     style_id: style.Id = style.default_id,
 
+    semantic_type: Cell.SemanticType = .output,
+
     /// The hyperlink ID that is currently active for the cursor. A value
     /// of zero means no hyperlink is active. (Implements OSC8, saying that
     /// so code search can find it.).
@@ -166,6 +168,7 @@ pub const SavedCursor = struct {
     pending_wrap: bool,
     origin: bool,
     charset: CharsetState,
+    semantic_type: Cell.SemanticType,
 };
 
 /// State required for all charset operations.
@@ -1917,6 +1920,15 @@ pub fn appendGrapheme(self: *Screen, cell: *Cell, cp: u21) !void {
     };
 }
 
+/// A semantic zone is a continuous run of cells that have the same
+/// semantic meaning. By default, all screen data is considered output.
+/// The shell can mark other kinds of zones using OSC 133 sequences.
+pub const SemanticZone = struct {
+    start: Pin,
+    // end: Pin,
+    kind: Cell.SemanticType,
+};
+
 pub const StartHyperlinkError = Allocator.Error || PageList.AdjustCapacityError;
 
 /// Start the hyperlink state. Future cells will be marked as hyperlinks with
@@ -2319,7 +2331,7 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
     const semantic_prompt_state: ?bool = state: {
         if (!opts.semantic_prompt_boundary) break :state null;
         const rac = opts.pin.rowAndCell();
-        break :state rac.row.semantic_prompt.promptOrInput();
+        break :state rac.row.semantic_prompt_or_input;
     };
 
     // The real start of the row is the first row in the soft-wrap.
@@ -2337,7 +2349,7 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
 
             if (semantic_prompt_state) |v| {
                 // See semantic_prompt_state comment for why
-                const current_prompt = row.semantic_prompt.promptOrInput();
+                const current_prompt = row.semantic_prompt_or_input;
                 if (current_prompt != v) {
                     var copy = it_prev;
                     copy.x = 0;
@@ -2361,7 +2373,7 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
 
             if (semantic_prompt_state) |v| {
                 // See semantic_prompt_state comment for why
-                const current_prompt = row.semantic_prompt.promptOrInput();
+                const current_prompt = row.semantic_prompt_or_input;
                 if (current_prompt != v) {
                     var prev = p.up(1).?;
                     prev.x = p.node.data.size.cols - 1;
@@ -2628,13 +2640,9 @@ pub fn selectWord(self: *Screen, pin: Pin) ?Selection {
 pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
     _ = self;
 
-    switch (pin.rowAndCell().row.semantic_prompt) {
-        .input, .prompt_continuation, .prompt => {
-            // Cursor on a prompt line, selection impossible
-            return null;
-        },
-
-        else => {},
+    // Cursor on a prompt line, selection impossible
+    if (pin.rowAndCell().row.semantic_prompt_or_input) {
+        return null;
     }
 
     // Go forwards to find our end boundary
@@ -2644,13 +2652,10 @@ pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
         var it_prev = pin;
         while (it.next()) |p| {
             const row = p.rowAndCell().row;
-            switch (row.semantic_prompt) {
-                .input, .prompt_continuation, .prompt => {
-                    var copy = it_prev;
-                    copy.x = it_prev.node.data.size.cols - 1;
-                    break :boundary copy;
-                },
-                else => {},
+            if (row.semantic_prompt_or_input) {
+                var copy = it_prev;
+                copy.x = it_prev.node.data.size.cols - 1;
+                break :boundary copy;
             }
 
             it_prev = p;
@@ -2683,14 +2688,8 @@ pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
         while (it.next()) |p| {
             it_prev = p;
             const row = p.rowAndCell().row;
-            switch (row.semantic_prompt) {
-                .command => break,
-
-                .unknown,
-                .prompt,
-                .prompt_continuation,
-                .input,
-                => {},
+            if (!row.semantic_prompt_or_input) {
+                break;
             }
         }
 
@@ -2699,14 +2698,8 @@ pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
         // yield the previous row.
         while (it.next()) |p| {
             const row = p.rowAndCell().row;
-            switch (row.semantic_prompt) {
-                .command => {},
-
-                .unknown,
-                .prompt,
-                .prompt_continuation,
-                .input,
-                => break :boundary it_prev,
+            if (row.semantic_prompt_or_input) {
+                break :boundary it_prev;
             }
             it_prev = p;
         }
@@ -2729,18 +2722,23 @@ pub fn selectPrompt(self: *Screen, pin: Pin) ?Selection {
     _ = self;
 
     // Ensure that the line the point is on is a prompt.
-    const is_known = switch (pin.rowAndCell().row.semantic_prompt) {
-        .prompt, .prompt_continuation, .input => true,
-        .command => return null,
+    if (!pin.rowAndCell().row.semantic_prompt_or_input) {
+        return null;
+    }
+    const is_known = true;
 
-        // We allow unknown to continue because not all shells output any
-        // semantic prompt information for continuation lines. This has the
-        // possibility of making this function VERY slow (we look at all
-        // scrollback) so we should try to avoid this in the future by
-        // setting a flag or something if we have EVER seen a semantic
-        // prompt sequence.
-        .unknown => false,
-    };
+    // const is_known = switch (pin.rowAndCell().row.semantic_prompt) {
+    //     .prompt, .prompt_continuation, .input => true,
+    //     .command => return null,
+
+    //     // We allow unknown to continue because not all shells output any
+    //     // semantic prompt information for continuation lines. This has the
+    //     // possibility of making this function VERY slow (we look at all
+    //     // scrollback) so we should try to avoid this in the future by
+    //     // setting a flag or something if we have EVER seen a semantic
+    //     // prompt sequence.
+    //     .unknown => false,
+    // };
 
     // Find the start of the prompt.
     var saw_semantic_prompt = is_known;
@@ -2967,6 +2965,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                     .content = .{ .codepoint = c },
                     .style_id = self.cursor.style_id,
                     .protected = self.cursor.protected,
+                    .semantic_type = self.cursor.semantic_type,
                 };
 
                 // If we have a hyperlink, add it to the cell.
@@ -2988,6 +2987,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                         .content = .{ .codepoint = 0 },
                         .wide = .spacer_head,
                         .protected = self.cursor.protected,
+                        .semantic_type = self.cursor.semantic_type,
                     };
 
                     // If we have a hyperlink, add it to the cell.
@@ -3006,6 +3006,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                     .style_id = self.cursor.style_id,
                     .wide = .wide,
                     .protected = self.cursor.protected,
+                    .semantic_type = self.cursor.semantic_type,
                 };
 
                 // If we have a hyperlink, add it to the cell.
@@ -3018,6 +3019,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                     .content = .{ .codepoint = 0 },
                     .wide = .spacer_tail,
                     .protected = self.cursor.protected,
+                    .semantic_type = self.cursor.semantic_type,
                 };
 
                 // If we have a hyperlink, add it to the cell.
@@ -7378,6 +7380,7 @@ test "Screen: selectLine semantic prompt boundary" {
         const pin = s.pages.pin(.{ .screen = .{ .y = 1 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .prompt;
+        row.semantic_prompt_or_input = true;
     }
 
     // Selecting output stops at the prompt even if soft-wrapped
@@ -7781,36 +7784,43 @@ test "Screen: selectOutput" {
         const pin = s.pages.pin(.{ .screen = .{ .y = 2 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .prompt;
+        row.semantic_prompt_or_input = true;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 3 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .input;
+        row.semantic_prompt_or_input = true;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 4 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .command;
+        row.semantic_prompt_or_input = false;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 5 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .command;
+        row.semantic_prompt_or_input = false;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 6 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .command;
+        row.semantic_prompt_or_input = false;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 8 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .input;
+        row.semantic_prompt_or_input = true;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 9 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .command;
+        row.semantic_prompt_or_input = false;
     }
 
     // No start marker, should select from the beginning
@@ -7872,11 +7882,13 @@ test "Screen: selectOutput" {
             const pin = s.pages.pin(.{ .screen = .{ .y = 0 } }).?;
             const row = pin.rowAndCell().row;
             row.semantic_prompt = .input;
+            row.semantic_prompt_or_input = true;
         }
         {
             const pin = s.pages.pin(.{ .screen = .{ .y = 1 } }).?;
             const row = pin.rowAndCell().row;
             row.semantic_prompt = .command;
+            row.semantic_prompt_or_input = false;
         }
         try testing.expect(s.selectOutput(s.pages.pin(.{ .active = .{
             .x = 2,
@@ -7912,26 +7924,31 @@ test "Screen: selectPrompt basics" {
         const pin = s.pages.pin(.{ .screen = .{ .y = 2 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .prompt;
+        row.semantic_prompt_or_input = true;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 3 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .input;
+        row.semantic_prompt_or_input = true;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 4 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .command;
+        row.semantic_prompt_or_input = false;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 6 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .input;
+        row.semantic_prompt_or_input = true;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 7 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .command;
+        row.semantic_prompt_or_input = false;
     }
 
     // Not at a prompt
@@ -8006,16 +8023,19 @@ test "Screen: selectPrompt prompt at start" {
         const pin = s.pages.pin(.{ .screen = .{ .y = 0 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .prompt;
+        row.semantic_prompt_or_input = true;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 1 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .input;
+        row.semantic_prompt_or_input = true;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 2 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .command;
+        row.semantic_prompt_or_input = false;
     }
 
     // Not at a prompt
@@ -8066,11 +8086,13 @@ test "Screen: selectPrompt prompt at end" {
         const pin = s.pages.pin(.{ .screen = .{ .y = 2 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .prompt;
+        row.semantic_prompt_or_input = true;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 3 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .input;
+        row.semantic_prompt_or_input = true;
     }
 
     // Not at a prompt
@@ -8127,26 +8149,31 @@ test "Screen: promptPath" {
         const pin = s.pages.pin(.{ .screen = .{ .y = 2 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .prompt;
+        row.semantic_prompt_or_input = true;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 3 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .input;
+        row.semantic_prompt_or_input = true;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 4 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .command;
+        row.semantic_prompt_or_input = false;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 6 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .input;
+        row.semantic_prompt_or_input = true;
     }
     {
         const pin = s.pages.pin(.{ .screen = .{ .y = 7 } }).?;
         const row = pin.rowAndCell().row;
         row.semantic_prompt = .command;
+        row.semantic_prompt_or_input = false;
     }
 
     // From is not in the prompt
