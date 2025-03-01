@@ -839,7 +839,7 @@ const ReflowCursor = struct {
 
             // If the row has a semantic prompt then the blank row is meaningful
             // so we just consider pretend the first cell of the row isn't empty.
-            if (cols_len == 0 and src_row.semantic_prompt != .unknown) cols_len = 1;
+            if (cols_len == 0 and src_row.semantic_prompt) cols_len = 1;
         }
 
         // Handle tracked pin adjustments.
@@ -1263,7 +1263,7 @@ const ReflowCursor = struct {
 
         // If the row has a semantic prompt then the blank row is meaningful
         // so we always return all but one so that the row is drawn.
-        if (self.page_row.semantic_prompt != .unknown) return len - 1;
+        if (self.page_row.semantic_prompt) return len - 1;
 
         return len;
     }
@@ -1715,14 +1715,10 @@ fn scrollPrompt(self: *PageList, delta: isize) void {
     var prompt_pin: ?Pin = null;
     while (it.next()) |next| {
         const row = next.rowAndCell().row;
-        switch (row.semantic_prompt) {
-            .command, .unknown => {},
-            .prompt, .prompt_continuation, .input => {
-                delta_rem -= 1;
-                prompt_pin = next;
-            },
+        if (row.semantic_prompt) {
+            delta_rem -= 1;
+            prompt_pin = next;
         }
-
         if (delta_rem == 0) break;
     }
 
@@ -3375,9 +3371,8 @@ pub const Pin = struct {
         // because prompts often contain special formatting (such as
         // powerline) that looks bad when extended.
         const rac = self.rowAndCell();
-        switch (rac.row.semantic_prompt) {
-            .prompt, .prompt_continuation, .input => return true,
-            .unknown, .command => {},
+        if (rac.row.semantic_prompt) {
+            return true;
         }
 
         for (self.cells(.all)) |*cell| {
@@ -4342,11 +4337,13 @@ test "PageList: jump zero" {
     const page = &s.pages.first.?.data;
     {
         const rac = page.getRowAndCell(0, 1);
-        rac.row.semantic_prompt = .prompt;
+        rac.row.semantic_prompt = true;
+        for (page.getCells(rac.row)) |*c| c.semantic_type = .prompt;
     }
     {
         const rac = page.getRowAndCell(0, 5);
-        rac.row.semantic_prompt = .prompt;
+        rac.row.semantic_prompt = true;
+        for (page.getCells(rac.row)) |*c| c.semantic_type = .prompt;
     }
 
     s.scroll(.{ .delta_prompt = 0 });
@@ -4364,11 +4361,11 @@ test "Screen: jump to prompt" {
     const page = &s.pages.first.?.data;
     {
         const rac = page.getRowAndCell(0, 1);
-        rac.row.semantic_prompt = .prompt;
+        rac.row.semantic_prompt = true;
     }
     {
         const rac = page.getRowAndCell(0, 5);
-        rac.row.semantic_prompt = .prompt;
+        rac.row.semantic_prompt = true;
     }
 
     // Jump back
@@ -7206,7 +7203,8 @@ test "PageList resize reflow more cols no reflow preserves semantic prompt" {
         try testing.expect(s.pages.first == s.pages.last);
         const page = &s.pages.first.?.data;
         const rac = page.getRowAndCell(0, 1);
-        rac.row.semantic_prompt = .prompt;
+        rac.row.semantic_prompt = true;
+        for (page.getCells(rac.row)) |*c| c.semantic_type = .prompt;
     }
 
     // Resize
@@ -7218,7 +7216,7 @@ test "PageList resize reflow more cols no reflow preserves semantic prompt" {
         try testing.expect(s.pages.first == s.pages.last);
         const page = &s.pages.first.?.data;
         const rac = page.getRowAndCell(0, 1);
-        try testing.expect(rac.row.semantic_prompt == .prompt);
+        try testing.expect(rac.row.semantic_prompt);
     }
 }
 
@@ -7491,13 +7489,14 @@ test "PageList resize reflow less cols no reflow preserves semantic prompt" {
         const page = &s.pages.first.?.data;
         {
             const rac = page.getRowAndCell(0, 1);
-            rac.row.semantic_prompt = .prompt;
+            rac.row.semantic_prompt = true;
         }
         for (0..s.cols) |x| {
             const rac = page.getRowAndCell(x, 1);
             rac.cell.* = .{
                 .content_tag = .codepoint,
                 .content = .{ .codepoint = @intCast(x) },
+                .semantic_type = .prompt,
             };
         }
     }
@@ -7513,12 +7512,12 @@ test "PageList resize reflow less cols no reflow preserves semantic prompt" {
             const p = s.pin(.{ .active = .{ .y = 1 } }).?;
             const rac = p.rowAndCell();
             try testing.expect(rac.row.wrap);
-            try testing.expect(rac.row.semantic_prompt == .prompt);
+            try testing.expect(rac.row.semantic_prompt);
         }
         {
             const p = s.pin(.{ .active = .{ .y = 2 } }).?;
             const rac = p.rowAndCell();
-            try testing.expect(rac.row.semantic_prompt == .prompt);
+            try testing.expect(rac.row.semantic_prompt);
         }
     }
 }
@@ -7533,7 +7532,8 @@ test "PageList resize reflow less cols no reflow preserves semantic prompt on fi
         try testing.expect(s.pages.first == s.pages.last);
         const page = &s.pages.first.?.data;
         const rac = page.getRowAndCell(0, 0);
-        rac.row.semantic_prompt = .prompt;
+        rac.row.semantic_prompt = true;
+        for (page.getCells(rac.row)) |*c| c.semantic_type = .prompt;
     }
 
     // Resize
@@ -7545,7 +7545,7 @@ test "PageList resize reflow less cols no reflow preserves semantic prompt on fi
         try testing.expect(s.pages.first == s.pages.last);
         const page = &s.pages.first.?.data;
         const rac = page.getRowAndCell(0, 0);
-        try testing.expect(rac.row.semantic_prompt == .prompt);
+        try testing.expect(rac.row.semantic_prompt);
     }
 }
 
@@ -7559,7 +7559,8 @@ test "PageList resize reflow less cols wrap preserves semantic prompt" {
         try testing.expect(s.pages.first == s.pages.last);
         const page = &s.pages.first.?.data;
         const rac = page.getRowAndCell(0, 0);
-        rac.row.semantic_prompt = .prompt;
+        rac.row.semantic_prompt = true;
+        for (page.getCells(rac.row)) |*c| c.semantic_type = .prompt;
     }
 
     // Resize
@@ -7571,7 +7572,7 @@ test "PageList resize reflow less cols wrap preserves semantic prompt" {
         try testing.expect(s.pages.first == s.pages.last);
         const page = &s.pages.first.?.data;
         const rac = page.getRowAndCell(0, 0);
-        try testing.expect(rac.row.semantic_prompt == .prompt);
+        try testing.expect(rac.row.semantic_prompt);
     }
 }
 
