@@ -301,6 +301,7 @@ pub const Page = struct {
         InvalidSpacerTailLocation,
         InvalidSpacerHeadLocation,
         UnwrappedSpacerHead,
+        MismatchedSemanticPrompt,
     };
 
     /// Temporarily pause integrity checks. This is useful when you are
@@ -373,6 +374,7 @@ pub const Page = struct {
 
         const rows = self.rows.ptr(self.memory)[0..self.size.rows];
         for (rows, 0..) |*row, y| {
+            var has_semantic_prompt_cells = false;
             const graphemes_start = graphemes_seen;
             const cells = row.cells.ptr(self.memory)[0..self.size.cols];
             for (cells, 0..) |*cell, x| {
@@ -457,6 +459,10 @@ pub const Page = struct {
                     }
                 }
 
+                if (cell.semantic_type == .input or cell.semantic_type == .prompt) {
+                    has_semantic_prompt_cells = true;
+                }
+
                 switch (cell.wide) {
                     .narrow => {},
                     .wide => {},
@@ -503,6 +509,16 @@ pub const Page = struct {
                         }
                     },
                 }
+            }
+
+            // Verify that the row-level semantic prompt flag accurately reflects
+            // whether or not it contains any semantic prompt cells.
+            if (row.semantic_prompt_or_input != has_semantic_prompt_cells) {
+                log.warn(
+                    "page integrity violation y={} semantic prompt mismatch row={} cells={}",
+                    .{ y, row.semantic_prompt_or_input, has_semantic_prompt_cells },
+                );
+                return IntegrityError.MismatchedSemanticPrompt;
             }
 
             // Check row grapheme data
@@ -1913,6 +1929,10 @@ pub const Row = packed struct(u64) {
     /// false negatives. This is used to optimize hyperlink operations.
     hyperlink: bool = false,
 
+    /// True if any of the cells in this row are marked as a semantic
+    /// prompt or input.
+    semantic_prompt_or_input: bool = false,
+
     /// The semantic prompt type for this row as specified by the
     /// running program, or "unknown" if it was never set.
     semantic_prompt: SemanticPrompt = .unknown,
@@ -1921,7 +1941,7 @@ pub const Row = packed struct(u64) {
     /// graphics protocol. (U+10EEEE)
     kitty_virtual_placeholder: bool = false,
 
-    _padding: u23 = 0,
+    _padding: u22 = 0,
 
     /// Semantic prompt type.
     pub const SemanticPrompt = enum(u3) {
@@ -1992,7 +2012,13 @@ pub const Cell = packed struct(u64) {
     /// the hyperlink_set to get the actual hyperlink data.
     hyperlink: bool = false,
 
-    _padding: u18 = 0,
+    /// NOTE: This could be be reduced to a single flag (bit) indicating
+    /// whether or not this cell has a semantic type other than output.
+    /// In those cases, we could use a separate page-managed mapping to
+    /// look up whether this cell represents command input or a prompt.
+    semantic_type: SemanticType = .output,
+
+    _padding: u16 = 0,
 
     pub const ContentTag = enum(u2) {
         /// A single codepoint, could be zero to be empty cell.
@@ -2029,6 +2055,12 @@ pub const Cell = packed struct(u64) {
         /// Spacer at the end of a soft-wrapped line to indicate that a wide
         /// character is continued on the next line.
         spacer_head = 3,
+    };
+
+    pub const SemanticType = enum(u2) {
+        output = 0,
+        input = 1,
+        prompt = 2,
     };
 
     /// Helper to make a cell that just has a codepoint.
