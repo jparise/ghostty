@@ -647,6 +647,7 @@ fn printCell(
         .style_id = self.screen.cursor.style_id,
         .wide = wide,
         .protected = self.screen.cursor.protected,
+        .semantic_type = self.screen.cursor.semantic_type,
     };
 
     if (style_changed) {
@@ -921,6 +922,7 @@ pub fn saveCursor(self: *Terminal) void {
         .pending_wrap = self.screen.cursor.pending_wrap,
         .origin = self.modes.get(.origin),
         .charset = self.screen.charset,
+        .semantic_type = self.screen.cursor.semantic_type,
     };
 }
 
@@ -937,6 +939,7 @@ pub fn restoreCursor(self: *Terminal) !void {
         .pending_wrap = false,
         .origin = false,
         .charset = .{},
+        .semantic_type = .output,
     };
 
     // Set the style first because it can fail
@@ -949,6 +952,7 @@ pub fn restoreCursor(self: *Terminal) !void {
     self.modes.set(.origin, saved.origin);
     self.screen.cursor.pending_wrap = saved.pending_wrap;
     self.screen.cursor.protected = saved.protected;
+    self.screen.cursor.semantic_type = saved.semantic_type;
     self.screen.cursorAbsolute(
         @min(saved.x, self.cols - 1),
         @min(saved.y, self.rows - 1),
@@ -997,13 +1001,28 @@ pub const SemanticPrompt = enum {
 /// (OSC 133) only allow setting this for wherever the current active cursor
 /// is located.
 pub fn markSemanticPrompt(self: *Terminal, p: SemanticPrompt) void {
-    //log.debug("semantic_prompt y={} p={}", .{ self.screen.cursor.y, p });
-    self.screen.cursor.page_row.semantic_prompt = switch (p) {
-        .prompt => .prompt,
-        .prompt_continuation => .prompt_continuation,
-        .input => .input,
-        .command => .command,
-    };
+    //log.debug("semantic_prompt={s} y={} x={}", .{ @tagName(p), self.screen.cursor.y, self.screen.cursor.x });
+
+    // Set the cursor to this semantic type (for this and future cells) and
+    // also immediately update the current cell and row to reflect the new
+    // semantic state. The latter two must always be kept in sync, which is
+    // something we assert in our page-level integrity checks.
+    switch (p) {
+        .prompt, .prompt_continuation => {
+            self.screen.cursor.semantic_type = .prompt;
+            self.screen.cursor.page_cell.semantic_type = .prompt;
+            self.screen.cursor.page_row.semantic_prompt = true;
+        },
+        .input => {
+            self.screen.cursor.semantic_type = .input;
+            self.screen.cursor.page_cell.semantic_type = .input;
+            self.screen.cursor.page_row.semantic_prompt = true;
+        },
+        .command => {
+            self.screen.cursor.semantic_type = .output;
+            self.screen.cursor.page_cell.semantic_type = .output;
+        },
+    }
 }
 
 /// Returns true if the cursor is currently at a prompt. Another way to look
@@ -1015,29 +1034,7 @@ pub fn cursorIsAtPrompt(self: *Terminal) bool {
     // If we're on the secondary screen, we're never at a prompt.
     if (self.active_screen == .alternate) return false;
 
-    // Reverse through the active
-    const start_x, const start_y = .{ self.screen.cursor.x, self.screen.cursor.y };
-    defer self.screen.cursorAbsolute(start_x, start_y);
-
-    for (0..start_y + 1) |i| {
-        if (i > 0) self.screen.cursorUp(1);
-        switch (self.screen.cursor.page_row.semantic_prompt) {
-            // If we're at a prompt or input area, then we are at a prompt.
-            .prompt,
-            .prompt_continuation,
-            .input,
-            => return true,
-
-            // If we have command output, then we're most certainly not
-            // at a prompt.
-            .command => return false,
-
-            // If we don't know, we keep searching.
-            .unknown => {},
-        }
-    }
-
-    return false;
+    return self.screen.cursor.semantic_type != .output;
 }
 
 /// Horizontal tab moves the cursor to the next tabstop, clearing
@@ -2145,20 +2142,7 @@ pub fn eraseDisplay(
                 );
                 while (it.next()) |p| {
                     const row = p.rowAndCell().row;
-                    switch (row.semantic_prompt) {
-                        // If we're at a prompt or input area, then we are at a prompt.
-                        .prompt,
-                        .prompt_continuation,
-                        .input,
-                        => break,
-
-                        // If we have command output, then we're most certainly not
-                        // at a prompt.
-                        .command => break :at_prompt,
-
-                        // If we don't know, we keep searching.
-                        .unknown => {},
-                    }
+                    if (row.semantic_prompt) break :at_prompt;
                 } else break :at_prompt;
 
                 self.screen.scrollClear() catch {
@@ -3802,11 +3786,11 @@ test "Terminal: soft wrap with semantic prompt" {
 
     {
         const list_cell = t.screen.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
-        try testing.expectEqual(Row.SemanticPrompt.prompt, list_cell.row.semantic_prompt);
+        try testing.expect(list_cell.row.semantic_prompt);
     }
     {
         const list_cell = t.screen.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
-        try testing.expectEqual(Row.SemanticPrompt.prompt, list_cell.row.semantic_prompt);
+        try testing.expect(list_cell.row.semantic_prompt);
     }
 }
 
