@@ -109,6 +109,10 @@ pub const Cursor = struct {
     /// our style when used.
     style_id: style.Id = style.default_id,
 
+    /// The semantic type of the cursor. This is set via OSC 133 shell
+    /// markers and will be applied to cells as they're printed.
+    semantic_type: Cell.SemanticType = .none,
+
     /// The hyperlink ID that is currently active for the cursor. A value
     /// of zero means no hyperlink is active. (Implements OSC8, saying that
     /// so code search can find it.).
@@ -166,6 +170,7 @@ pub const SavedCursor = struct {
     pending_wrap: bool,
     origin: bool,
     charset: CharsetState,
+    semantic_type: Cell.SemanticType,
 };
 
 /// State required for all charset operations.
@@ -1323,6 +1328,23 @@ pub fn clearCells(
         } else row.kitty_virtual_placeholder = false;
     }
 
+    // Reset the row-level semantic prompt flag if we're about to clear
+    // all of the row's semantic prompt cells. If at least one remains,
+    // the flag needs to remain set.
+    if (row.semantic_prompt) semantic_prompt: {
+        if (cells.len == self.pages.cols) {
+            row.semantic_prompt = false;
+            break :semantic_prompt;
+        }
+
+        const row_cells = page.getCells(row);
+        for (row_cells) |c| {
+            if (c.semantic_type.promptOrInput()) break :semantic_prompt;
+        }
+
+        row.semantic_prompt = false;
+    }
+
     @memset(cells, self.blankCell());
 }
 
@@ -1369,8 +1391,15 @@ pub fn clearPrompt(self: *Screen) void {
         self.pages.pin(.{ .active = .{} }),
     );
     while (it.next()) |p| {
-        const row = p.rowAndCell().row;
-        switch (row.semantic_prompt) {
+        const rac = p.rowAndCell();
+
+        // Stop searching when we're no longer on a row with a prompt.
+        if (!rac.row.semantic_prompt) break;
+
+        // XXX: This implementation only checks the first cell in each row.
+        switch (rac.cell.semantic_type) {
+            .none => continue,
+
             // We are at a prompt but we're not at the start of the prompt.
             // We mark our found value and continue because the prompt
             // may be multi-line, unless this is the second time we've
@@ -1384,17 +1413,14 @@ pub fn clearPrompt(self: *Screen) void {
             // If we find the prompt then we're done. We are also done
             // if we find any prompt continuation, because the shells
             // that send this currently (zsh) cannot redraw every line.
-            .prompt, .prompt_continuation => {
+            .prompt => {
                 found = p;
                 break;
             },
 
             // If we have command output, then we're most certainly not
             // at a prompt. Break out of the loop.
-            .command => break,
-
-            // If we don't know, we keep searching.
-            .unknown => {},
+            .output => break,
         }
     }
 
@@ -2349,7 +2375,7 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
     const semantic_prompt_state: ?bool = state: {
         if (!opts.semantic_prompt_boundary) break :state null;
         const rac = opts.pin.rowAndCell();
-        break :state rac.row.semantic_prompt.promptOrInput();
+        break :state rac.row.semantic_prompt;
     };
 
     // The real start of the row is the first row in the soft-wrap.
@@ -2367,7 +2393,7 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
 
             if (semantic_prompt_state) |v| {
                 // See semantic_prompt_state comment for why
-                const current_prompt = row.semantic_prompt.promptOrInput();
+                const current_prompt = row.semantic_prompt;
                 if (current_prompt != v) {
                     var copy = it_prev;
                     copy.x = 0;
@@ -2391,7 +2417,7 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
 
             if (semantic_prompt_state) |v| {
                 // See semantic_prompt_state comment for why
-                const current_prompt = row.semantic_prompt.promptOrInput();
+                const current_prompt = row.semantic_prompt;
                 if (current_prompt != v) {
                     var prev = p.up(1).?;
                     prev.x = p.node.data.size.cols - 1;
@@ -2658,13 +2684,9 @@ pub fn selectWord(self: *Screen, pin: Pin) ?Selection {
 pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
     _ = self;
 
-    switch (pin.rowAndCell().row.semantic_prompt) {
-        .input, .prompt_continuation, .prompt => {
-            // Cursor on a prompt line, selection impossible
-            return null;
-        },
-
-        else => {},
+    // Cursor on a prompt line, selection impossible
+    if (pin.rowAndCell().row.semantic_prompt) {
+        return null;
     }
 
     // Go forwards to find our end boundary
@@ -2674,13 +2696,10 @@ pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
         var it_prev = pin;
         while (it.next()) |p| {
             const row = p.rowAndCell().row;
-            switch (row.semantic_prompt) {
-                .input, .prompt_continuation, .prompt => {
-                    var copy = it_prev;
-                    copy.x = it_prev.node.data.size.cols - 1;
-                    break :boundary copy;
-                },
-                else => {},
+            if (row.semantic_prompt) {
+                var copy = it_prev;
+                copy.x = it_prev.node.data.size.cols - 1;
+                break :boundary copy;
             }
 
             it_prev = p;
@@ -2713,14 +2732,8 @@ pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
         while (it.next()) |p| {
             it_prev = p;
             const row = p.rowAndCell().row;
-            switch (row.semantic_prompt) {
-                .command => break,
-
-                .unknown,
-                .prompt,
-                .prompt_continuation,
-                .input,
-                => {},
+            if (!row.semantic_prompt) {
+                break;
             }
         }
 
@@ -2729,14 +2742,8 @@ pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
         // yield the previous row.
         while (it.next()) |p| {
             const row = p.rowAndCell().row;
-            switch (row.semantic_prompt) {
-                .command => {},
-
-                .unknown,
-                .prompt,
-                .prompt_continuation,
-                .input,
-                => break :boundary it_prev,
+            if (row.semantic_prompt) {
+                break :boundary it_prev;
             }
             it_prev = p;
         }
@@ -2758,50 +2765,25 @@ pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
 pub fn selectPrompt(self: *Screen, pin: Pin) ?Selection {
     _ = self;
 
-    // Ensure that the line the point is on is a prompt.
-    const is_known = switch (pin.rowAndCell().row.semantic_prompt) {
-        .prompt, .prompt_continuation, .input => true,
-        .command => return null,
-
-        // We allow unknown to continue because not all shells output any
-        // semantic prompt information for continuation lines. This has the
-        // possibility of making this function VERY slow (we look at all
-        // scrollback) so we should try to avoid this in the future by
-        // setting a flag or something if we have EVER seen a semantic
-        // prompt sequence.
-        .unknown => false,
-    };
+    // Ensure that this line contains a prompt.
+    if (!pin.rowAndCell().row.semantic_prompt) {
+        return null;
+    }
 
     // Find the start of the prompt.
-    var saw_semantic_prompt = is_known;
     const start: Pin = start: {
         var it = pin.rowIterator(.left_up, null);
         var it_prev = it.next().?;
         while (it.next()) |p| {
             const row = p.rowAndCell().row;
-            switch (row.semantic_prompt) {
-                // A prompt, we continue searching.
-                .prompt, .prompt_continuation, .input => saw_semantic_prompt = true,
-
-                // See comment about "unknown" a few lines above. If we have
-                // previously seen a semantic prompt then if we see an unknown
-                // we treat it as a boundary.
-                .unknown => if (saw_semantic_prompt) break :start it_prev,
-
-                // Command output or unknown, definitely not a prompt.
-                .command => break :start it_prev,
+            if (!row.semantic_prompt) {
+                break :start it_prev;
             }
-
             it_prev = p;
         }
 
         break :start it_prev;
     };
-
-    // If we never saw a semantic prompt flag, then we can't trust our
-    // start value and we return null. This scenario usually means that
-    // semantic prompts aren't enabled via the shell.
-    if (!saw_semantic_prompt) return null;
 
     // Find the end of the prompt.
     const end: Pin = end: {
@@ -2810,14 +2792,9 @@ pub fn selectPrompt(self: *Screen, pin: Pin) ?Selection {
         it_prev.x = it_prev.node.data.size.cols - 1;
         while (it.next()) |p| {
             const row = p.rowAndCell().row;
-            switch (row.semantic_prompt) {
-                // A prompt, we continue searching.
-                .prompt, .prompt_continuation, .input => {},
-
-                // Command output or unknown, definitely not a prompt.
-                .command, .unknown => break :end it_prev,
+            if (!row.semantic_prompt) {
+                break :end it_prev;
             }
-
             it_prev = p;
             it_prev.x = it_prev.node.data.size.cols - 1;
         }
@@ -2997,6 +2974,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                     .content = .{ .codepoint = c },
                     .style_id = self.cursor.style_id,
                     .protected = self.cursor.protected,
+                    .semantic_type = self.cursor.semantic_type,
                 };
 
                 // If we have a hyperlink, add it to the cell.
@@ -3018,6 +2996,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                         .content = .{ .codepoint = 0 },
                         .wide = .spacer_head,
                         .protected = self.cursor.protected,
+                        .semantic_type = self.cursor.semantic_type,
                     };
 
                     // If we have a hyperlink, add it to the cell.
@@ -3036,6 +3015,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                     .style_id = self.cursor.style_id,
                     .wide = .wide,
                     .protected = self.cursor.protected,
+                    .semantic_type = self.cursor.semantic_type,
                 };
 
                 // If we have a hyperlink, add it to the cell.
@@ -3048,6 +3028,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                     .content = .{ .codepoint = 0 },
                     .wide = .spacer_tail,
                     .protected = self.cursor.protected,
+                    .semantic_type = self.cursor.semantic_type,
                 };
 
                 // If we have a hyperlink, add it to the cell.
@@ -3065,6 +3046,10 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
             else => unreachable,
         }
 
+        if (self.cursor.semantic_type.promptOrInput()) {
+            self.cursor.page_row.semantic_prompt = true;
+        }
+
         if (self.cursor.x + 1 < self.pages.cols) {
             self.cursorRight(1);
         } else {
@@ -3074,26 +3059,12 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
 }
 
 /// Write text that's marked as a semantic prompt.
-fn testWriteSemanticString(self: *Screen, text: []const u8, semantic_prompt: Row.SemanticPrompt) !void {
-    // Determine the first row using the cursor position. If we know that our
-    // first write is going to start on the next line because of a pending
-    // wrap, we'll proactively start there.
-    const start_y = if (self.cursor.pending_wrap) self.cursor.y + 1 else self.cursor.y;
+fn testWriteSemanticString(self: *Screen, text: []const u8, semantic_type: Cell.SemanticType) !void {
+    const old_semantic_type = self.cursor.semantic_type;
+    defer self.cursor.semantic_type = old_semantic_type;
 
+    self.cursor.semantic_type = semantic_type;
     try self.testWriteString(text);
-
-    // Determine the last row that we actually wrote by inspecting the cursor's
-    // position. If we're in the first column, we haven't actually written any
-    // characters to it, so we end at the preceding row instead.
-    const end_y = if (self.cursor.x > 0) self.cursor.y else self.cursor.y - 1;
-
-    // Mark the full range of written rows with our semantic prompt.
-    var y = start_y;
-    while (y <= end_y) {
-        const pin = self.pages.pin(.{ .active = .{ .y = y } }).?;
-        pin.rowAndCell().row.semantic_prompt = semantic_prompt;
-        y += 1;
-    }
 }
 
 test "Screen read and write" {
@@ -3716,7 +3687,7 @@ test "Screen: clearPrompt" {
     defer s.deinit();
 
     // Set one of the rows to be a prompt
-    try s.testWriteSemanticString("1ABCD\n", .unknown);
+    try s.testWriteSemanticString("1ABCD\n", .output);
     try s.testWriteSemanticString("2EFGH\n", .prompt);
     try s.testWriteSemanticString("3IJKL", .input);
 
@@ -3737,9 +3708,9 @@ test "Screen: clearPrompt continuation" {
     defer s.deinit();
 
     // Set one of the rows to be a prompt followed by a continuation row
-    try s.testWriteSemanticString("1ABCD\n", .unknown);
+    try s.testWriteSemanticString("1ABCD\n", .output);
     try s.testWriteSemanticString("2EFGH\n", .prompt);
-    try s.testWriteSemanticString("3IJKL\n", .prompt_continuation);
+    try s.testWriteSemanticString("3IJKL\n", .prompt);
     try s.testWriteSemanticString("4MNOP", .input);
 
     s.clearPrompt();
@@ -3759,7 +3730,7 @@ test "Screen: clearPrompt consecutive inputs" {
     defer s.deinit();
 
     // Set both rows to be inputs
-    try s.testWriteSemanticString("1ABCD\n", .unknown);
+    try s.testWriteSemanticString("1ABCD\n", .output);
     try s.testWriteSemanticString("2EFGH\n", .input);
     try s.testWriteSemanticString("3IJKL", .input);
 
@@ -6071,9 +6042,9 @@ test "Screen: resize more cols no reflow preserves semantic prompt" {
     defer s.deinit();
 
     // Set one of the rows to be a prompt
-    try s.testWriteSemanticString("1ABCD\n", .unknown);
+    try s.testWriteSemanticString("1ABCD\n", .output);
     try s.testWriteSemanticString("2EFGH\n", .prompt);
-    try s.testWriteSemanticString("3IJKL", .unknown);
+    try s.testWriteSemanticString("3IJKL", .input);
 
     try s.resize(10, 3);
 
@@ -6092,15 +6063,18 @@ test "Screen: resize more cols no reflow preserves semantic prompt" {
     // Our one row should still be a semantic prompt, the others should not.
     {
         const list_cell = s.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
-        try testing.expect(list_cell.row.semantic_prompt == .unknown);
+        try testing.expect(list_cell.cell.semantic_type == .output);
+        try testing.expect(!list_cell.row.semantic_prompt);
     }
     {
         const list_cell = s.pages.getCell(.{ .active = .{ .x = 0, .y = 1 } }).?;
-        try testing.expect(list_cell.row.semantic_prompt == .prompt);
+        try testing.expect(list_cell.cell.semantic_type == .prompt);
+        try testing.expect(list_cell.row.semantic_prompt);
     }
     {
         const list_cell = s.pages.getCell(.{ .active = .{ .x = 0, .y = 2 } }).?;
-        try testing.expect(list_cell.row.semantic_prompt == .unknown);
+        try testing.expect(list_cell.cell.semantic_type == .input);
+        try testing.expect(list_cell.row.semantic_prompt);
     }
 }
 
@@ -7517,9 +7491,9 @@ test "Screen: selectLine semantic prompt boundary" {
 
     var s = try init(alloc, 5, 10, 0);
     defer s.deinit();
-    try s.testWriteSemanticString("ABCDE\n", .unknown);
+    try s.testWriteSemanticString("ABCDE\n", .output);
     try s.testWriteSemanticString("A    ", .prompt);
-    try s.testWriteSemanticString("> ", .unknown);
+    try s.testWriteSemanticString("> ", .output);
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
@@ -7911,20 +7885,20 @@ test "Screen: selectOutput" {
     // zig fmt: off
     {
                                                                   // line number:
-        try s.testWriteSemanticString("output1\n", .command);     // 0
-        try s.testWriteSemanticString("output1\n", .command);     // 1
+        try s.testWriteSemanticString("output1\n", .output);      // 0
+        try s.testWriteSemanticString("output1\n", .output);      // 1
         try s.testWriteSemanticString("prompt2\n", .prompt);      // 2
         try s.testWriteSemanticString("input2\n", .input);        // 3
         try s.testWriteSemanticString(                            //
             "output2output2output2output2\n",                     // 4, 5, 6 due to overflow
-            .command,                                             //
+            .output,                                              //
         );                                                        //
-        try s.testWriteSemanticString("output2\n", .command);     // 7
+        try s.testWriteSemanticString("output2\n", .output);      // 7
         try s.testWriteSemanticString("$ ", .prompt);             // 8 prompt
         try s.testWriteSemanticString("input3\n", .input);        // 8 input
-        try s.testWriteSemanticString("output3\n", .command);     // 9
-        try s.testWriteSemanticString("output3\n", .command);     // 10
-        try s.testWriteSemanticString("output3", .command);       // 11
+        try s.testWriteSemanticString("output3\n", .output);      // 9
+        try s.testWriteSemanticString("output3\n", .output);      // 10
+        try s.testWriteSemanticString("output3", .output);        // 11
     }
     // zig fmt: on
 
@@ -7982,7 +7956,7 @@ test "Screen: selectOutput" {
         s = try init(alloc, 10, 5, 0);
         try s.testWriteSemanticString("$ ", .prompt);
         try s.testWriteSemanticString("input1\n", .input);
-        try s.testWriteSemanticString("output1\n", .command);
+        try s.testWriteSemanticString("output1\n", .output);
         try s.testWriteSemanticString("prompt2\n", .prompt);
         try testing.expect(s.selectOutput(s.pages.pin(.{ .active = .{
             .x = 2,
@@ -8001,17 +7975,17 @@ test "Screen: selectPrompt basics" {
     // zig fmt: off
     {
                                                                 // line number:
-        try s.testWriteSemanticString("output1\n", .command);   // 0
-        try s.testWriteSemanticString("output1\n", .command);   // 1
+        try s.testWriteSemanticString("output1\n", .output);    // 0
+        try s.testWriteSemanticString("output1\n", .output);    // 1
         try s.testWriteSemanticString("prompt2\n", .prompt);    // 2
         try s.testWriteSemanticString("input2\n", .input);      // 3
-        try s.testWriteSemanticString("output2\n", .command);   // 4
-        try s.testWriteSemanticString("output2\n", .command);   // 5
+        try s.testWriteSemanticString("output2\n", .output);    // 4
+        try s.testWriteSemanticString("output2\n", .output);    // 5
         try s.testWriteSemanticString("$ ", .prompt);           // 6 prompt
         try s.testWriteSemanticString("input3\n", .input);      // 6 input
-        try s.testWriteSemanticString("output3\n", .command);   // 7
-        try s.testWriteSemanticString("output3\n", .command);   // 8
-        try s.testWriteSemanticString("output3", .command);     // 9
+        try s.testWriteSemanticString("output3\n", .output);    // 7
+        try s.testWriteSemanticString("output3\n", .output);    // 8
+        try s.testWriteSemanticString("output3", .output);      // 9
     }
     // zig fmt: on
 
@@ -8078,8 +8052,8 @@ test "Screen: selectPrompt prompt at start" {
                                                                 // line number:
         try s.testWriteSemanticString("prompt1\n", .prompt);    // 0
         try s.testWriteSemanticString("input1\n", .input);      // 1
-        try s.testWriteSemanticString("output2\n", .command);   // 2
-        try s.testWriteSemanticString("output2\n", .command);   // 3
+        try s.testWriteSemanticString("output2\n", .output);    // 2
+        try s.testWriteSemanticString("output2\n", .output);    // 3
     }
     // zig fmt: on
 
@@ -8120,8 +8094,8 @@ test "Screen: selectPrompt prompt at end" {
     // zig fmt: off
     {
                                                                 // line number:
-        try s.testWriteSemanticString("output2\n", .command);   // 0
-        try s.testWriteSemanticString("output2\n", .command);   // 1
+        try s.testWriteSemanticString("output2\n", .output);    // 0
+        try s.testWriteSemanticString("output2\n", .output);    // 1
         try s.testWriteSemanticString("prompt1\n", .prompt);    // 2
         try s.testWriteSemanticString("input1\n", .input);      // 3
     }
@@ -8164,17 +8138,17 @@ test "Screen: promptPath" {
     // zig fmt: off
     {
                                                                 // line number:
-        try s.testWriteSemanticString("output1\n", .command);   // 0
-        try s.testWriteSemanticString("output1\n", .command);   // 1
+        try s.testWriteSemanticString("output1\n", .output);    // 0
+        try s.testWriteSemanticString("output1\n", .output);    // 1
         try s.testWriteSemanticString("prompt2\n", .prompt);    // 2
         try s.testWriteSemanticString("input2\n", .input);      // 3
-        try s.testWriteSemanticString("output2\n", .command);   // 4
-        try s.testWriteSemanticString("output2\n", .command);   // 5
+        try s.testWriteSemanticString("output2\n", .output);    // 4
+        try s.testWriteSemanticString("output2\n", .output);    // 5
         try s.testWriteSemanticString("$ ", .prompt);           // 6 prompt
         try s.testWriteSemanticString("input3\n", .input);      // 6 input
-        try s.testWriteSemanticString("output3\n", .command);   // 7
-        try s.testWriteSemanticString("output3\n", .command);   // 8
-        try s.testWriteSemanticString("output3", .command);     // 9
+        try s.testWriteSemanticString("output3\n", .output);    // 7
+        try s.testWriteSemanticString("output3\n", .output);    // 8
+        try s.testWriteSemanticString("output3", .output);      // 9
     }
     // zig fmt: on
 
