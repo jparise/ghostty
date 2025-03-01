@@ -23,6 +23,9 @@ pub const Cell = struct {
     /// Wide state of the terminal cell
     wide: terminal.Cell.Wide,
 
+    /// Semantic type of this cell.
+    semantic_type: terminal.Cell.SemanticType,
+
     pub fn init(
         alloc: Allocator,
         pin: terminal.Pin,
@@ -41,6 +44,7 @@ pub const Cell = struct {
             .cps = cps,
             .style = style,
             .wide = cell.wide,
+            .semantic_type = cell.semantic_type,
         };
     }
 
@@ -121,6 +125,13 @@ pub const Cell = struct {
         cimgui.c.igText("Width Property");
         _ = cimgui.c.igTableSetColumnIndex(1);
         cimgui.c.igText(@tagName(self.wide));
+
+        // Semantic type
+        cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
+        _ = cimgui.c.igTableSetColumnIndex(0);
+        cimgui.c.igText("Semantic Type");
+        _ = cimgui.c.igTableSetColumnIndex(1);
+        cimgui.c.igText(@tagName(self.semantic_type));
 
         // If we have a color then we show the color
         cimgui.c.igTableNextRow(cimgui.c.ImGuiTableRowFlags_None, 0);
