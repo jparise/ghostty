@@ -421,6 +421,8 @@ pub const Action = union(enum) {
     /// Does nothing when no text is selected.
     write_selection_file: WriteScreenAction,
 
+    write_semantic_file: WriteScreenAction,
+
     /// Open a new window.
     ///
     /// If the application isn't currently focused,
@@ -1061,6 +1063,7 @@ pub const Action = union(enum) {
             .write_scrollback_file,
             .write_screen_file,
             .write_selection_file,
+            .write_semantic_file,
             .close_surface,
             .close_tab,
             .close_window,
