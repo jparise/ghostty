@@ -1428,6 +1428,7 @@ pub fn clearPrompt(self: *Screen) void {
     if (found) |top| {
         var clear_it = top.rowIterator(.right_down, null);
         while (clear_it.next()) |p| {
+            // log.debug("prompt: clearing row {}", .{p.y});
             const row = p.rowAndCell().row;
             p.node.data.clearCells(row, 0, p.node.data.size.cols);
         }
@@ -2918,6 +2919,46 @@ pub fn dumpStringAllocUnwrapped(
     });
 
     return try builder.toOwnedSlice();
+}
+
+pub fn dumpSemantic(self: *const Screen, writer: anytype) !void {
+    const tl = self.pages.getTopLeft(.screen);
+    const br = self.pages.getBottomRight(.screen);
+
+    var it = tl.rowIterator(.right_down, br);
+    while (it.next()) |p| {
+        const row = p.rowAndCell().row;
+
+        var cells: [256]u8 = undefined;
+        for (p.cells(.all), 0..) |c, i| {
+            cells[i] = switch (c.semantic_type) {
+                .none => '?',
+                .prompt => '$',
+                .input => '_',
+                .output => '.',
+            };
+        }
+
+        log.debug("{:>3} {s} {s}", .{
+            p.y,
+            if (row.semantic_prompt) "+" else "-",
+            cells[0..self.pages.cols],
+        });
+
+        // try writer.print("{:>3} ", .{p.y});
+        // try writer.writeByte(if (row.semantic_prompt) '+' else '-');
+        // try writer.writeByte(' ');
+
+        for (p.cells(.all)) |c| {
+            try writer.writeByte(switch (c.semantic_type) {
+                .none => '?',
+                .prompt => '$',
+                .input => '_',
+                .output => '.',
+            });
+        }
+        try writer.writeByte('\n');
+    }
 }
 
 /// This is basically a really jank version of Terminal.printString. We

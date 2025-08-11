@@ -4762,6 +4762,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             v,
         ),
 
+        .write_semantic_file => |v| try self.writeScreenFile(
+            .semantic,
+            v,
+        ),
+
         .new_tab => return try self.rt_app.performAction(
             .{ .surface = self },
             .new_tab,
@@ -5023,6 +5028,7 @@ const WriteScreenLoc = enum {
     screen, // Full screen
     history, // History (scrollback)
     selection, // Selected text
+    semantic, // Semantic cells
 };
 
 fn writeScreenFile(
@@ -5075,7 +5081,7 @@ fn writeScreenFile(
                 );
             },
 
-            .screen => screen: {
+            .screen, .semantic => screen: {
                 break :screen terminal.Selection.init(
                     pages.getTopLeft(.screen),
                     pages.getBottomRight(.screen) orelse
@@ -5097,14 +5103,20 @@ fn writeScreenFile(
         const tl = sel.topLeft(&self.io.terminal.screen);
         const br = sel.bottomRight(&self.io.terminal.screen);
 
-        try self.io.terminal.screen.dumpString(
-            buf_writer.writer(),
-            .{
-                .tl = tl,
-                .br = br,
-                .unwrap = true,
-            },
-        );
+        if (loc == .semantic) {
+            try self.io.terminal.screen.dumpSemantic(
+                buf_writer.writer(),
+            );
+        } else {
+            try self.io.terminal.screen.dumpString(
+                buf_writer.writer(),
+                .{
+                    .tl = tl,
+                    .br = br,
+                    .unwrap = true,
+                },
+            );
+        }
     }
     try buf_writer.flush();
 
