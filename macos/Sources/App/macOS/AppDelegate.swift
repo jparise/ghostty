@@ -353,14 +353,33 @@ class AppDelegate: NSObject,
         return derivedConfig.shouldQuitAfterLastWindowClosed
     }
 
+    /// Initiates graceful application termination.
+    private func terminateGracefully() -> NSApplication.TerminateReply {
+        /// Free our surfaces synchronously, ensuring SIGHUP signals are sent to all
+        /// child processes (e.g., bash) so they can clean up before the app exits.
+        TerminalController.freeAllSurfaces()
+
+        if !quickController.surfaceTree.isEmpty {
+            quickController.freeSurfaces()
+        }
+
+        // Schedule termination after a brief delay to allow child processes
+        // to handle SIGHUP and complete cleanup (e.g., bash saving history).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+
+        return .terminateLater
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let windows = NSApplication.shared.windows
-        if windows.isEmpty { return .terminateNow }
+        if windows.isEmpty { return terminateGracefully() }
 
         // If we've already accepted to install an update, then we don't need to
         // confirm quit. The user is already expecting the update to happen.
         if updateController.isInstalling {
-            return .terminateNow
+            return terminateGracefully()
         }
 
         // This probably isn't fully safe. The isEmpty check above is aspirational, it doesn't
@@ -371,7 +390,7 @@ class AppDelegate: NSObject,
         // here because I don't want to remove it in a patch release cycle but we should
         // target removing it soon.
         if (windows.allSatisfy { !$0.isVisible }) {
-            return .terminateNow
+            return terminateGracefully()
         }
 
         // If the user is shutting down, restarting, or logging out, we don't confirm quit.
@@ -384,8 +403,7 @@ class AppDelegate: NSObject,
             if let why = event.attributeDescriptor(forKeyword: keyword) {
                 switch why.typeCodeValue {
                 case kAEShutDown, kAERestart, kAEReallyLogOut:
-                    return .terminateNow
-
+                    return terminateGracefully()
                 default:
                     break
                 }
@@ -393,7 +411,7 @@ class AppDelegate: NSObject,
         }
 
         // If our app says we don't need to confirm, we can exit now.
-        if !ghostty.needsConfirmQuit { return .terminateNow }
+        if !ghostty.needsConfirmQuit { return terminateGracefully() }
 
         // We have some visible window. Show an app-wide modal to confirm quitting.
         let alert = NSAlert()
@@ -404,7 +422,7 @@ class AppDelegate: NSObject,
         alert.alertStyle = .warning
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            return .terminateNow
+            return terminateGracefully()
 
         default:
             return .terminateCancel
