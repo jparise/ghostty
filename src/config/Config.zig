@@ -2710,7 +2710,9 @@ keybind: Keybinds = .{},
 ///
 /// Available features:
 ///
-///   * `cursor` - Set the cursor to a bar at the prompt.
+///   * `cursor` - Set the cursor to a bar at the prompt. By default, this uses
+///     the cursor-style-blink configuration value. You can override this with
+///     `cursor:blink` for a blinking bar or `cursor:steady` for a steady bar.
 ///
 ///   * `sudo` - Set sudo wrapper to preserve terminfo.
 ///
@@ -8183,13 +8185,173 @@ pub const ShellIntegration = enum {
 };
 
 /// Shell integration features
-pub const ShellIntegrationFeatures = packed struct {
-    cursor: bool = true,
-    sudo: bool = false,
-    title: bool = true,
+pub const ShellIntegrationFeatures = struct {
+    pub const Cursor = enum { disabled, default, blink, steady };
+
+    cursor: Cursor = .default,
+    path: bool = true,
     @"ssh-env": bool = false,
     @"ssh-terminfo": bool = false,
-    path: bool = true,
+    sudo: bool = false,
+    title: bool = true,
+
+    comptime {
+        const fields = @typeInfo(ShellIntegrationFeatures).@"struct".fields;
+        for (fields[0 .. fields.len - 1], fields[1..]) |a, b| {
+            if (std.ascii.orderIgnoreCase(a.name, b.name) != .lt) {
+                @compileError("ShellIntegrationFeatures fields must be in alphabetical order");
+            }
+        }
+    }
+
+    pub fn parseCLI(input: ?[]const u8) !ShellIntegrationFeatures {
+        const v = input orelse return error.ValueRequired;
+        var result: ShellIntegrationFeatures = .{};
+
+        // Handle "true" or "false" to toggle all features
+        if (std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "false")) {
+            const b = std.mem.eql(u8, v, "true");
+            result.cursor = if (b) .default else .disabled;
+            inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
+                if (field.type == bool) {
+                    @field(result, field.name) = b;
+                }
+            }
+            return result;
+        }
+
+        var iter = std.mem.splitSequence(u8, v, ",");
+        loop: while (iter.next()) |part_raw| {
+            const trimmed = std.mem.trim(u8, part_raw, cli.args.whitespace);
+
+            // Handle cursor[:value] syntax
+            if (std.mem.startsWith(u8, trimmed, "cursor")) {
+                if (std.mem.indexOf(u8, trimmed, ":")) |colon| {
+                    const value = trimmed[colon + 1 ..];
+                    result.cursor = std.meta.stringToEnum(Cursor, value) orelse return error.InvalidValue;
+                } else {
+                    result.cursor = .default;
+                }
+                continue;
+            } else if (std.mem.eql(u8, trimmed, "no-cursor")) {
+                result.cursor = .disabled;
+                continue;
+            }
+
+            const name, const value = part: {
+                const negation_prefix = "no-";
+                const trimmed_name = std.mem.trim(u8, part_raw, cli.args.whitespace);
+                if (std.mem.startsWith(u8, trimmed, negation_prefix)) {
+                    break :part .{ trimmed_name[negation_prefix.len..], false };
+                } else {
+                    break :part .{ trimmed_name, true };
+                }
+            };
+
+            inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
+                if (field.type == bool and std.mem.eql(u8, field.name, name)) {
+                    @field(result, field.name) = value;
+                    continue :loop;
+                }
+            }
+
+            // No field matched
+            return error.InvalidValue;
+        }
+
+        return result;
+    }
+
+    pub fn format(self: ShellIntegrationFeatures, writer: *std.Io.Writer) anyerror!void {
+        inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
+            const enabled = switch (field.type) {
+                bool => @field(self, field.name),
+                Cursor => @field(self, field.name) != .disabled,
+                else => @compileError("unexpected field type in ShellIntegrationFeatures"),
+            };
+            if (enabled) {
+                if (writer.end > 0) try writer.writeByte(',');
+                try writer.writeAll(field.name);
+                switch (field.type) {
+                    Cursor => {
+                        const value = @field(self, field.name);
+                        if (value != .default) {
+                            try writer.writeByte(':');
+                            try writer.writeAll(@tagName(value));
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
+    pub fn formatEntry(self: ShellIntegrationFeatures, formatter: formatterpkg.EntryFormatter) !void {
+        var buf: [256]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try self.format(&writer);
+        try formatter.formatEntry([]const u8, buf[0..writer.end]);
+    }
+
+    pub fn clone(self: ShellIntegrationFeatures, _: Allocator) error{}!ShellIntegrationFeatures {
+        return self;
+    }
+
+    pub fn equal(self: ShellIntegrationFeatures, other: ShellIntegrationFeatures) bool {
+        return std.meta.eql(self, other);
+    }
+
+    test "parseCLI" {
+        const testing = std.testing;
+
+        // Test that we can parse each bool field by name.
+        inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
+            if (comptime field.type == bool) {
+                const result = try ShellIntegrationFeatures.parseCLI(field.name);
+                try testing.expect(@field(result, field.name));
+            }
+        }
+
+        // Cursor variants.
+        try testing.expectEqual(.default, (try ShellIntegrationFeatures.parseCLI("cursor")).cursor);
+        try testing.expectEqual(.blink, (try ShellIntegrationFeatures.parseCLI("cursor:blink")).cursor);
+        try testing.expectEqual(.steady, (try ShellIntegrationFeatures.parseCLI("cursor:steady")).cursor);
+        try testing.expectEqual(.disabled, (try ShellIntegrationFeatures.parseCLI("no-cursor")).cursor);
+
+        // Test all comma-separated fields names.
+        const all_input = comptime blk: {
+            const fields = @typeInfo(ShellIntegrationFeatures).@"struct".fields;
+            var buf: []const u8 = fields[0].name;
+            for (fields[1..]) |field| buf = buf ++ "," ++ field.name;
+            break :blk buf;
+        };
+        const all_features = try ShellIntegrationFeatures.parseCLI(all_input);
+        inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
+            const value = @field(all_features, field.name);
+            switch (field.type) {
+                bool => try testing.expect(value),
+                Cursor => try testing.expectEqual(.default, value),
+                else => @compileError("unexpected field type in ShellIntegrationFeatures"),
+            }
+        }
+    }
+
+    test "format" {
+        const testing = std.testing;
+
+        const testFormat = struct {
+            fn f(features: ShellIntegrationFeatures, expected: []const u8) !void {
+                var buf: [256]u8 = undefined;
+                var writer: std.Io.Writer = .fixed(&buf);
+                try features.format(&writer);
+                try testing.expectEqualStrings(expected, buf[0..writer.end]);
+            }
+        }.f;
+
+        try testFormat(.{ .cursor = .steady, .title = true }, "cursor:steady,path,title");
+        try testFormat(.{ .cursor = .default, .sudo = true }, "cursor,path,sudo,title");
+        try testFormat(.{ .cursor = .disabled, .title = true }, "path,title");
+    }
 };
 
 pub const SplitPreserveZoom = packed struct {
