@@ -1201,8 +1201,10 @@ pub fn semanticPrompt(
                 }
             }
 
-            // The "aid" and "cl" options are also valid for this
-            // command but we don't yet handle these in any meaningful way.
+            // Track this command on the stack for aid-based nesting resolution.
+            if (Screen.SemanticPrompt.Aid.parse(cmd.readOption(.aid))) |aid| {
+                screen.semantic_prompt.stack.push(&screen.pages, aid, screen.cursor.page_pin.*);
+            }
         },
 
         .new_command => {
@@ -1214,10 +1216,12 @@ pub fn semanticPrompt(
             // nested more deeply). If no aid is specified, treat as an
             // aid whose value is the empty string.
 
-            // Ghostty:
-            // We don't currently do explicit command tracking in any way
-            // so there is no need to terminate prior commands. We just
-            // perform the `A` action.
+            // First, close any matching command (and those nested within it).
+            if (Screen.SemanticPrompt.Aid.parse(cmd.readOption(.aid))) |aid| {
+                self.screens.active.semantic_prompt.stack.popUntil(&self.screens.active.pages, aid);
+            }
+
+            // Then perform the `A` action (which will push a new command).
             try self.semanticPrompt(.{
                 .action = .fresh_line_new_prompt,
                 .options_unvalidated = cmd.options_unvalidated,
@@ -1253,6 +1257,9 @@ pub fn semanticPrompt(
             // "End of input, and start of output."
             self.screens.active.cursorSetSemanticContent(.output);
 
+            // Mark command execution start time for the current command.
+            self.screens.active.semantic_prompt.markCommandStart();
+
             // If our current row is marked as a prompt and we're
             // at column zero then we assume we're un-prompting. This
             // is a heuristic to deal with fish, mostly. The issue that
@@ -1270,10 +1277,13 @@ pub fn semanticPrompt(
         },
 
         .end_command => {
-            // From a terminal state perspective, this doesn't really do
-            // anything. Other terminals appear to do nothing here. I think
-            // its reasonable at this point to reset our semantic content
-            // state but the spec doesn't really say what to do.
+            // Close the command matching this aid. If no aid is provided,
+            // the command is not tracked and we don't need to pop.
+            if (Screen.SemanticPrompt.Aid.parse(cmd.readOption(.aid))) |aid| {
+                self.screens.active.semantic_prompt.stack.popUntil(&self.screens.active.pages, aid);
+            }
+
+            // Reset semantic content to output.
             self.screens.active.cursorSetSemanticContent(.output);
         },
     }
@@ -12385,6 +12395,43 @@ test "Terminal: OSC133A no click options leaves click as none" {
     });
 
     try testing.expectEqual(.none, t.screens.active.semantic_prompt.click);
+}
+
+test "Terminal: OSC133 aid stack" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    const stack = &t.screens.active.semantic_prompt.stack;
+    try testing.expectEqual(0, stack.len);
+
+    // Push via OSC 133;A with aid
+    try t.semanticPrompt(.{ .action = .fresh_line_new_prompt, .options_unvalidated = "aid=100" });
+    try testing.expectEqual(1, stack.len);
+    try testing.expect(stack.top().?.aid.eql(.{ .pid = 100 }));
+
+    // Push another
+    try t.semanticPrompt(.{ .action = .fresh_line_new_prompt, .options_unvalidated = "aid=200" });
+    try testing.expectEqual(2, stack.len);
+
+    // Pop with non-matching aid does nothing
+    try t.semanticPrompt(.{ .action = .end_command, .options_unvalidated = "aid=999" });
+    try testing.expectEqual(2, stack.len);
+
+    // Pop with matching aid
+    try t.semanticPrompt(.{ .action = .end_command, .options_unvalidated = "aid=200" });
+    try testing.expectEqual(1, stack.len);
+
+    // Pop with unknown aid pops top
+    try t.semanticPrompt(.{ .action = .fresh_line_new_prompt, .options_unvalidated = "aid=300" });
+    try testing.expectEqual(2, stack.len);
+    try t.semanticPrompt(.{ .action = .end_command, .options_unvalidated = "" });
+    try testing.expectEqual(1, stack.len);
+    try testing.expect(stack.top().?.aid.eql(.{ .pid = 100 }));
+
+    // N with matching aid closes and reopens
+    try t.semanticPrompt(.{ .action = .new_command, .options_unvalidated = "aid=100" });
+    try testing.expectEqual(1, stack.len);
 }
 
 test "Terminal: cursorIsAtPrompt" {

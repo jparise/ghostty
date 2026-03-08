@@ -78,7 +78,7 @@ pub const Info = struct {
             if (cimgui.c.ImGui_CollapsingHeader(
                 "Semantic Prompt",
                 cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
-            )) semanticPromptTable(&screen.semantic_prompt);
+            )) semanticPromptTable(&screen.semantic_prompt, &screen.pages);
 
             if (cimgui.c.ImGui_CollapsingHeader(
                 "Kitty Graphics",
@@ -365,6 +365,7 @@ pub fn internalStateTable(
 /// Render semantic prompt state table.
 pub fn semanticPromptTable(
     semantic_prompt: *const terminal.Screen.SemanticPrompt,
+    pages: *const terminal.PageList,
 ) void {
     if (!cimgui.c.ImGui_BeginTable(
         "##semantic_prompt",
@@ -395,6 +396,52 @@ pub fn semanticPromptTable(
             .none => cimgui.c.ImGui_TextDisabled("(none)"),
             .click_events => cimgui.c.ImGui_Text("click_events"),
             .cl => |cl| cimgui.c.ImGui_Text("cl=%s", @tagName(cl).ptr),
+        }
+    }
+
+    {
+        cimgui.c.ImGui_TableNextRow();
+        _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+        cimgui.c.ImGui_Text("Command Stack");
+        cimgui.c.ImGui_SameLine();
+        widgets.helpMarker("Stack of active commands tracked via OSC 133 aid parameter.");
+        _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+        cimgui.c.ImGui_Text("%d", @as(c_int, semantic_prompt.stack.len));
+    }
+
+    for (semantic_prompt.stack.entries[0..semantic_prompt.stack.len], 0..) |entry, i| {
+        cimgui.c.ImGui_TableNextRow();
+        _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+        cimgui.c.ImGui_Text("  [%d]", @as(c_int, @intCast(i)));
+        _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+
+        // Row from pin
+        if (entry.pin) |pin| {
+            if (pages.pointFromPin(.screen, pin.*)) |pt| {
+                cimgui.c.ImGui_Text("row=%d", @as(c_int, @intCast(pt.coord().y)));
+            } else {
+                cimgui.c.ImGui_TextDisabled("row=?");
+            }
+        } else {
+            cimgui.c.ImGui_TextDisabled("(no pin)");
+        }
+
+        // Aid
+        cimgui.c.ImGui_SameLine();
+        switch (entry.aid) {
+            .pid => |pid| cimgui.c.ImGui_Text("pid=%u", @as(c_uint, pid)),
+            .hash => |h| cimgui.c.ImGui_Text("aid=0x%08X", @as(c_uint, h)),
+        }
+
+        // Elapsed time
+        cimgui.c.ImGui_SameLine();
+        if (entry.elapsedTime()) |ns| {
+            const secs = @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
+            cimgui.c.ImGui_Text("%.1fs", secs);
+        } else if (entry.command_start == null) {
+            cimgui.c.ImGui_TextDisabled("(at prompt)");
+        } else {
+            cimgui.c.ImGui_TextDisabled("(unavailable)");
         }
     }
 }

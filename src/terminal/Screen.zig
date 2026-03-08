@@ -105,9 +105,13 @@ pub const SemanticPrompt = struct {
     /// prompt is handling.
     click: SemanticClick,
 
+    /// Stack tracking active/open commands for aid-based nesting.
+    stack: Stack = .{},
+
     pub const disabled: SemanticPrompt = .{
         .seen = false,
         .click = .none,
+        .stack = .{},
     };
 
     pub const SemanticClick = union(enum) {
@@ -115,6 +119,155 @@ pub const SemanticPrompt = struct {
         click_events,
         cl: osc.semantic_prompt.Click,
     };
+
+    /// Application identifier for matching nested commands.
+    /// By convention, this is typically a process ID, but it can be any string.
+    pub const Aid = union(enum) {
+        pid: u32, // Numeric process ID
+        hash: u32, // FNV-1a hash of non-numeric string
+
+        pub fn parse(raw: ?[]const u8) ?Aid {
+            const s = raw orelse return null;
+            if (s.len == 0) return null;
+            return if (std.fmt.parseInt(u32, s, 10)) |v|
+                .{ .pid = v }
+            else |_|
+                .{ .hash = std.hash.Fnv1a_32.hash(s) };
+        }
+    };
+
+    /// Tracks nesting of OSC 133 commands using the `aid` (application identifier)
+    /// parameter. This enables proper resolution of nested command contexts, such
+    /// as when a shell runs a REPL that itself has prompts.
+    ///
+    /// The stack has bounded capacity. If exhausted, the oldest entry is evicted
+    /// to make room for new commands. This preserves tracking for the most recent
+    /// nesting levels at the cost of losing the outermost context.
+    ///
+    /// Index 0 is the oldest/outermost entry.
+    pub const Stack = struct {
+        const capacity = 8;
+
+        pub const Entry = struct {
+            aid: Aid,
+
+            /// Tracked pin to the start of this command's prompt (OSC 133;A).
+            pin: ?*PageList.Pin = null,
+
+            /// When command execution started (OSC 133;C).
+            command_start: ?std.time.Instant = null,
+
+            /// Returns elapsed time since command execution started, or null if unavailable.
+            pub fn elapsedTime(self: Entry) ?u64 {
+                const start = self.command_start orelse return null;
+                const now = std.time.Instant.now() catch return null;
+                return now.since(start);
+            }
+        };
+
+        entries: [capacity]Entry = undefined,
+        len: std.math.IntFittingRange(0, capacity) = 0,
+
+        /// Push a new command onto the stack. If the stack is full, the oldest
+        /// entry is evicted.
+        pub fn push(
+            self: *Stack,
+            pages: *PageList,
+            aid: Aid,
+            pin: PageList.Pin,
+        ) void {
+            // Skip duplicates: same aid and row as the top entry.
+            if (self.top()) |entry| {
+                if (std.meta.eql(entry.aid, aid)) {
+                    if (entry.pin) |p| {
+                        if (p.node == pin.node and p.y == pin.y) return;
+                    }
+                }
+            }
+
+            if (self.len >= capacity) {
+                const oldest = self.entries[0];
+                log.warn(
+                    "SemanticPrompt.Stack: evicting oldest entry: {}",
+                    .{oldest.aid},
+                );
+                if (oldest.pin) |p| pages.untrackPin(p);
+                fastmem.move(
+                    Entry,
+                    self.entries[0 .. capacity - 1],
+                    self.entries[1..capacity],
+                );
+                self.len -= 1;
+            }
+            self.entries[self.len] = .{
+                .aid = aid,
+                .pin = pages.trackPin(pin) catch null,
+            };
+            self.len += 1;
+        }
+
+        /// Pop commands until finding one matching `aid` (inclusive).
+        pub fn popUntil(self: *Stack, pages: *PageList, aid: Aid) void {
+            if (self.len == 0) return;
+
+            const idx = idx: {
+                var i = self.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (std.meta.eql(self.entries[i].aid, aid)) break :idx i;
+                }
+                return; // Not found, do nothing
+            };
+
+            // Untrack pins from popped entries.
+            for (self.entries[idx..self.len]) |entry| {
+                if (entry.pin) |p| pages.untrackPin(p);
+            }
+            self.len = idx;
+        }
+
+        /// Returns the top entry, or null if the stack is empty.
+        pub fn top(self: *const Stack) ?Entry {
+            if (self.len == 0) return null;
+            return self.entries[self.len - 1];
+        }
+
+        /// Clear all entries, untracking any pins.
+        pub fn clear(self: *Stack, pages: *PageList) void {
+            for (self.entries[0..self.len]) |entry| {
+                if (entry.pin) |p| pages.untrackPin(p);
+            }
+            self.len = 0;
+        }
+
+        /// Prune entries whose pins have been marked as garbage.
+        pub fn prune(self: *Stack, pages: *PageList) void {
+            var i: @TypeOf(self.len) = 0;
+            while (i < self.len) {
+                if (self.entries[i].pin) |p| {
+                    if (p.garbage) {
+                        pages.untrackPin(p);
+                        fastmem.move(
+                            Entry,
+                            self.entries[i .. self.len - 1],
+                            self.entries[i + 1 .. self.len],
+                        );
+                        self.len -= 1;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+    };
+
+    /// Mark the current command as started (OSC 133;C).
+    pub fn markCommandStart(self: *SemanticPrompt) void {
+        if (self.stack.len == 0) return;
+        const entry = &self.stack.entries[self.stack.len - 1];
+        if (entry.command_start != null) return;
+        entry.command_start = std.time.Instant.now() catch null;
+    }
 };
 
 /// The cursor position and style.
@@ -350,6 +503,11 @@ pub fn assertIntegrity(self: *const Screen) void {
         ) orelse unreachable;
         assert(self.cursor.x == pt.active.x);
         assert(self.cursor.y == pt.active.y);
+
+        // All tracked pins in the semantic prompt stack should be valid.
+        for (self.semantic_prompt.stack.entries[0..self.semantic_prompt.stack.len]) |entry| {
+            if (entry.pin) |pin| assert(!pin.garbage);
+        }
     }
 }
 
@@ -393,6 +551,7 @@ pub fn reset(self: *Screen) void {
     self.charset = .{};
     self.kitty_keyboard = .{};
     self.protected_mode = .off;
+    self.semantic_prompt.stack.clear(&self.pages);
     self.semantic_prompt = .disabled;
     self.clearSelection();
 }
@@ -846,6 +1005,7 @@ pub fn cursorDownScroll(self: *Screen) !void {
             const page_pin = if (old_pin.node == self.cursor.page_pin.node)
                 self.cursor.page_pin.down(1).?
             else reuse: {
+                self.semantic_prompt.stack.prune(&self.pages);
                 var pin = self.cursor.page_pin.*;
                 pin.x = self.cursor.x;
                 break :reuse pin;
@@ -924,6 +1084,7 @@ pub fn cursorScrollAbove(self: *Screen) !void {
 
     const old_pin = self.cursor.page_pin.*;
     if (try self.pages.grow()) |_| {
+        self.semantic_prompt.stack.prune(&self.pages);
         try self.cursorScrollAboveRotate();
     } else {
         // In this case, it means grow() didn't allocate a new page.
@@ -10349,4 +10510,211 @@ test "Screen: promptClickMove click right of input cursor on last char" {
 
     try testing.expectEqual(@as(usize, 1), result.right);
     try testing.expectEqual(@as(usize, 0), result.left);
+}
+
+test "SemanticPrompt.Aid.parse" {
+    const Aid = SemanticPrompt.Aid;
+
+    // Valid numeric aids become .pid
+    try std.testing.expectEqual(Aid{ .pid = 123 }, Aid.parse("123"));
+    try std.testing.expectEqual(Aid{ .pid = 0 }, Aid.parse("0"));
+    try std.testing.expectEqual(Aid{ .pid = 4294967295 }, Aid.parse("4294967295"));
+
+    // Missing/empty aids return null
+    try std.testing.expectEqual(null, Aid.parse(null));
+    try std.testing.expectEqual(null, Aid.parse(""));
+
+    // Non-numeric strings become .hash
+    try std.testing.expectEqual(.hash, std.meta.activeTag(Aid.parse("word").?));
+    try std.testing.expectEqual(.hash, std.meta.activeTag(Aid.parse("-1").?));
+    try std.testing.expectEqual(.hash, std.meta.activeTag(Aid.parse("99999999999").?));
+
+    // Same string produces same hash
+    try std.testing.expectEqual(Aid.parse("word"), Aid.parse("word"));
+
+    // Different strings produce different hashes
+    try std.testing.expect(!std.meta.eql(Aid.parse("foo").?, Aid.parse("bar").?));
+}
+
+test "SemanticPrompt.Stack: push and popUntil" {
+    const alloc = std.testing.allocator;
+    var s = try Screen.init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    var stack = &s.semantic_prompt.stack;
+    try std.testing.expectEqual(0, stack.len);
+
+    stack.push(&s.pages, .{ .pid = 100 }, s.cursor.page_pin.*);
+    try std.testing.expectEqual(1, stack.len);
+    try std.testing.expect(stack.entries[0].pin != null);
+
+    stack.popUntil(&s.pages, .{ .pid = 100 });
+    try std.testing.expectEqual(0, stack.len);
+}
+
+test "SemanticPrompt.Stack: push at capacity" {
+    const alloc = std.testing.allocator;
+    var s = try Screen.init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    var stack = &s.semantic_prompt.stack;
+    const capacity = SemanticPrompt.Stack.capacity;
+
+    // Fill to capacity
+    for (0..capacity) |i| {
+        stack.push(&s.pages, .{ .pid = @intCast(i) }, s.cursor.page_pin.*);
+    }
+    try std.testing.expectEqual(capacity, stack.len);
+
+    // Push beyond capacity - should evict oldest
+    stack.push(&s.pages, .{ .pid = 999 }, s.cursor.page_pin.*);
+    try std.testing.expectEqual(capacity, stack.len);
+
+    // Oldest (aid=0) was evicted, newest (aid=999) is at top
+    try std.testing.expectEqual(SemanticPrompt.Aid{ .pid = 1 }, stack.entries[0].aid);
+    try std.testing.expectEqual(SemanticPrompt.Aid{ .pid = 999 }, stack.entries[capacity - 1].aid);
+}
+
+test "SemanticPrompt.Stack: popUntil with no match" {
+    const alloc = std.testing.allocator;
+    var s = try Screen.init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    var stack = &s.semantic_prompt.stack;
+
+    stack.push(&s.pages, .{ .pid = 100 }, s.cursor.page_pin.*);
+    stack.push(&s.pages, .{ .pid = 200 }, s.cursor.page_pin.*);
+    try std.testing.expectEqual(2, stack.len);
+
+    // Close with non-matching aid - should do nothing
+    stack.popUntil(&s.pages, .{ .pid = 999 });
+    try std.testing.expectEqual(2, stack.len);
+}
+
+test "SemanticPrompt.Stack: popUntil closes nested commands" {
+    const alloc = std.testing.allocator;
+    var s = try Screen.init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    var stack = &s.semantic_prompt.stack;
+
+    // Simulate: shell (100) -> nested repl (200) -> deeper command (300)
+    stack.push(&s.pages, .{ .pid = 100 }, s.cursor.page_pin.*);
+    stack.push(&s.pages, .{ .pid = 200 }, s.cursor.page_pin.*);
+    stack.push(&s.pages, .{ .pid = 300 }, s.cursor.page_pin.*);
+    try std.testing.expectEqual(3, stack.len);
+
+    // Close matching aid=100 should close all three (100 and everything nested)
+    stack.popUntil(&s.pages, .{ .pid = 100 });
+    try std.testing.expectEqual(0, stack.len);
+}
+
+test "SemanticPrompt.Stack: popUntil closes from match point" {
+    const alloc = std.testing.allocator;
+    var s = try Screen.init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    var stack = &s.semantic_prompt.stack;
+
+    // shell (100) -> nested repl (200) -> deeper (300)
+    stack.push(&s.pages, .{ .pid = 100 }, s.cursor.page_pin.*);
+    stack.push(&s.pages, .{ .pid = 200 }, s.cursor.page_pin.*);
+    stack.push(&s.pages, .{ .pid = 300 }, s.cursor.page_pin.*);
+
+    // Close matching aid=200 should close 200 and 300, leaving 100
+    stack.popUntil(&s.pages, .{ .pid = 200 });
+    try std.testing.expectEqual(1, stack.len);
+    try std.testing.expectEqual(SemanticPrompt.Aid{ .pid = 100 }, stack.entries[0].aid);
+}
+
+test "SemanticPrompt.Stack: popUntil on empty stack" {
+    const alloc = std.testing.allocator;
+    var s = try Screen.init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    var stack = &s.semantic_prompt.stack;
+
+    stack.popUntil(&s.pages, .{ .pid = 100 });
+    try std.testing.expectEqual(0, stack.len);
+}
+
+test "SemanticPrompt.Stack: same aid on different rows creates separate entries" {
+    const alloc = std.testing.allocator;
+    var s = try Screen.init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    var stack = &s.semantic_prompt.stack;
+
+    // Same aid pushed from different rows creates two entries (nested shells case)
+    const pin1 = s.cursor.page_pin.*;
+    var pin2 = pin1;
+    pin2.y += 1;
+
+    stack.push(&s.pages, .{ .pid = 100 }, pin1);
+    stack.push(&s.pages, .{ .pid = 100 }, pin2);
+    try std.testing.expectEqual(2, stack.len);
+
+    // Pop removes only the most recent
+    stack.popUntil(&s.pages, .{ .pid = 100 });
+    try std.testing.expectEqual(1, stack.len);
+}
+
+test "SemanticPrompt.Stack: same aid same row is deduplicated" {
+    const alloc = std.testing.allocator;
+    var s = try Screen.init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    var stack = &s.semantic_prompt.stack;
+
+    // Same aid pushed from same row is deduplicated (prompt redraw case)
+    stack.push(&s.pages, .{ .pid = 100 }, s.cursor.page_pin.*);
+    stack.push(&s.pages, .{ .pid = 100 }, s.cursor.page_pin.*);
+    try std.testing.expectEqual(1, stack.len);
+}
+
+test "SemanticPrompt.Stack: top" {
+    const alloc = std.testing.allocator;
+    var s = try Screen.init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    var stack = &s.semantic_prompt.stack;
+
+    // Empty stack returns null
+    try std.testing.expect(stack.top() == null);
+
+    stack.push(&s.pages, .{ .pid = 100 }, s.cursor.page_pin.*);
+    try std.testing.expectEqual(SemanticPrompt.Aid{ .pid = 100 }, stack.top().?.aid);
+
+    stack.push(&s.pages, .{ .pid = 200 }, s.cursor.page_pin.*);
+    try std.testing.expectEqual(SemanticPrompt.Aid{ .pid = 200 }, stack.top().?.aid);
+
+    stack.popUntil(&s.pages, .{ .pid = 200 });
+    try std.testing.expectEqual(SemanticPrompt.Aid{ .pid = 100 }, stack.top().?.aid);
+}
+
+test "SemanticPrompt.Stack: prune" {
+    const alloc = std.testing.allocator;
+    var s = try Screen.init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    var stack = &s.semantic_prompt.stack;
+
+    // Push four entries
+    stack.push(&s.pages, .{ .pid = 100 }, s.cursor.page_pin.*);
+    stack.push(&s.pages, .{ .pid = 200 }, s.cursor.page_pin.*);
+    stack.push(&s.pages, .{ .pid = 300 }, s.cursor.page_pin.*);
+    stack.push(&s.pages, .{ .pid = 400 }, s.cursor.page_pin.*);
+    try std.testing.expectEqual(4, stack.len);
+
+    // Mark entries 0 and 2 as garbage (simulates content scrolled out)
+    stack.entries[0].pin.?.garbage = true;
+    stack.entries[2].pin.?.garbage = true;
+
+    // Prune should remove both garbage entries
+    stack.prune(&s.pages);
+    try std.testing.expectEqual(2, stack.len);
+
+    // Verify correct entries remain (200 and 400)
+    try std.testing.expectEqual(SemanticPrompt.Aid{ .pid = 200 }, stack.entries[0].aid);
+    try std.testing.expectEqual(SemanticPrompt.Aid{ .pid = 400 }, stack.entries[1].aid);
 }
