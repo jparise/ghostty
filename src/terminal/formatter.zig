@@ -124,6 +124,27 @@ pub const PinMap = struct {
     map: *std.ArrayList(Pin),
 };
 
+/// Records the byte offset where each watched Pin first appears in the
+/// emitted output. The `offset` field of each `PinOffset` is filled in
+/// by the formatter; entries left as null mean that Pin was not
+/// emitted.
+///
+/// The formatter still allocates a per-chunk scratch buffer of source
+/// coordinates (one entry per emitted byte, reused across chunks via
+/// `clearRetainingCapacity`), which is why an allocator is required.
+/// Peak memory is bounded by a single chunk's emitted-byte count —
+/// dramatically less than `PinMap`'s cumulative per-byte Pin array,
+/// but not zero.
+pub const PinOffsets = struct {
+    alloc: Allocator,
+    entries: []PinOffset,
+};
+
+pub const PinOffset = struct {
+    pin: Pin,
+    offset: ?usize = null,
+};
+
 /// Terminal formatter formats the active terminal screen.
 ///
 /// This will always only emit data related to the currently active screen.
@@ -447,6 +468,11 @@ pub const ScreenFormatter = struct {
     /// Warning: there is a significant performance hit to track this
     pin_map: ?PinMap,
 
+    /// If non-null, fills in `offsets` with the byte position where each
+    /// `pins` entry first appears in the emitted output. Lighter than
+    /// `pin_map` when you only need a handful of positions.
+    pin_offsets: ?PinOffsets,
+
     pub const Content = union(enum) {
         /// Emit no content, only terminal state such as modes, palette, etc.
         /// via extra.
@@ -528,6 +554,7 @@ pub const ScreenFormatter = struct {
             .content = .{ .selection = null },
             .extra = .none,
             .pin_map = null,
+            .pin_offsets = null,
         };
     }
 
@@ -542,6 +569,7 @@ pub const ScreenFormatter = struct {
                 // Emit our pagelist contents according to our selection.
                 var list_formatter: PageListFormatter = .init(&self.screen.pages, self.opts);
                 list_formatter.pin_map = self.pin_map;
+                list_formatter.pin_offsets = self.pin_offsets;
                 if (selection_) |sel| {
                     list_formatter.top_left = sel.topLeft(self.screen);
                     list_formatter.bottom_right = sel.bottomRight(self.screen);
@@ -716,6 +744,11 @@ pub const PageListFormatter = struct {
     /// Warning: there is a significant performance hit to track this
     pin_map: ?PinMap,
 
+    /// If non-null, fills in `offsets` with the byte position where each
+    /// `pins` entry first appears in the emitted output. Lighter than
+    /// `pin_map` when you only need a handful of positions.
+    pin_offsets: ?PinOffsets,
+
     pub fn init(
         list: *const PageList,
         opts: Options,
@@ -727,6 +760,7 @@ pub const PageListFormatter = struct {
             .bottom_right = null,
             .rectangle = false,
             .pin_map = null,
+            .pin_offsets = null,
         };
     }
 
@@ -737,9 +771,26 @@ pub const PageListFormatter = struct {
         const tl: PageList.Pin = self.top_left orelse self.list.getTopLeft(.screen);
         const br: PageList.Pin = self.bottom_right orelse self.list.getBottomRight(.screen).?;
 
-        // If we keep track of pins, we'll need this.
-        var point_map: std.ArrayList(Coordinate) = .empty;
-        defer if (self.pin_map) |*m| point_map.deinit(m.alloc);
+        // PageFormatter only knows about a single Page, so it can't
+        // track Pins directly. When the caller has asked for a pin_map
+        // or pin_offsets we feed PageFormatter a per-byte Coordinate
+        // scratch buffer and convert to Pins at the chunk boundary.
+        const PointMap = struct {
+            alloc: Allocator,
+            map: std.ArrayList(Coordinate),
+        };
+        var point_map: ?PointMap = point_map: {
+            const alloc = if (self.pin_map) |m|
+                m.alloc
+            else if (self.pin_offsets) |po|
+                po.alloc
+            else
+                break :point_map null;
+            break :point_map .{ .alloc = alloc, .map = .empty };
+        };
+        defer if (point_map) |*pm| pm.map.deinit(pm.alloc);
+
+        var running_byte_offset: usize = 0;
 
         var page_state: ?PageFormatter.TrailingState = null;
         var iter = tl.pageIterator(.right_down, br);
@@ -763,26 +814,35 @@ pub const PageListFormatter = struct {
                 if (chunk.node == br.node) formatter.end_x = br.x;
             }
 
-            // If we're tracking pins, then we setup a point map for the
-            // page formatter (cause it can't track pins). And then we convert
-            // this to pins later.
-            if (self.pin_map) |*m| {
-                point_map.clearRetainingCapacity();
-                formatter.point_map = .{ .alloc = m.alloc, .map = &point_map };
+            if (point_map) |*pm| {
+                pm.map.clearRetainingCapacity();
+                formatter.point_map = .{ .alloc = pm.alloc, .map = &pm.map };
             }
 
             page_state = try formatter.formatWithState(writer);
 
-            // If we're tracking pins then grab our points and write them
-            // to our pin map.
-            if (self.pin_map) |*m| {
-                for (point_map.items) |coord| {
-                    m.map.append(m.alloc, .{
-                        .node = chunk.node,
-                        .x = coord.x,
-                        .y = @intCast(coord.y),
-                    }) catch return error.WriteFailed;
+            if (point_map) |*pm| {
+                if (self.pin_map) |*m| {
+                    for (pm.map.items) |coord| {
+                        m.map.append(m.alloc, .{
+                            .node = chunk.node,
+                            .x = coord.x,
+                            .y = @intCast(coord.y),
+                        }) catch return error.WriteFailed;
+                    }
                 }
+                if (self.pin_offsets) |po| {
+                    for (po.entries) |*entry| {
+                        if (entry.offset != null or entry.pin.node != chunk.node) continue;
+                        for (pm.map.items, 0..) |coord, i| {
+                            if (coord.x == entry.pin.x and coord.y == entry.pin.y) {
+                                entry.offset = running_byte_offset + i;
+                                break;
+                            }
+                        }
+                    }
+                }
+                running_byte_offset += pm.map.items.len;
             }
         }
     }
@@ -6276,4 +6336,105 @@ test "Page HTML hyperlink point map maps closing to previous cell" {
     for (closing_idx..closing_idx + "</a>".len) |i| {
         try testing.expectEqual(expected_coord, point_map.items[i]);
     }
+}
+
+test "PageListFormatter pin_offsets records emitted bytes" {
+    const alloc = std.testing.allocator;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(alloc, .{ .cols = 2, .rows = 2 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("AB\r\nCD");
+
+    const pages = &t.screens.active.pages;
+    var entries = [_]PinOffset{
+        .{ .pin = pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).? }, // 'A'
+        .{ .pin = pages.pin(.{ .active = .{ .x = 1, .y = 0 } }).? }, // 'B'
+        .{ .pin = pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).? }, // 'C'
+        .{ .pin = pages.pin(.{ .active = .{ .x = 1, .y = 1 } }).? }, // 'D'
+    };
+
+    var formatter: PageListFormatter = .init(pages, .plain);
+    formatter.top_left = pages.getTopLeft(.active);
+    formatter.bottom_right = pages.getBottomRight(.active).?;
+    formatter.pin_offsets = .{ .alloc = alloc, .entries = &entries };
+    try formatter.format(&builder.writer);
+
+    const output = builder.writer.buffered();
+    try std.testing.expectEqualStrings("AB\nCD", output);
+    try std.testing.expectEqual(@as(?usize, 0), entries[0].offset);
+    try std.testing.expectEqual(@as(?usize, 1), entries[1].offset);
+    try std.testing.expectEqual(@as(?usize, 3), entries[2].offset);
+    try std.testing.expectEqual(@as(?usize, 4), entries[3].offset);
+}
+
+test "PageListFormatter pin_offsets null for absent pin" {
+    const alloc = std.testing.allocator;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("AB");
+
+    const pages = &t.screens.active.pages;
+    var entries = [_]PinOffset{
+        .{ .pin = pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).? },
+    };
+
+    var formatter: PageListFormatter = .init(pages, .plain);
+    formatter.top_left = pages.getTopLeft(.active);
+    formatter.bottom_right = pages.getBottomRight(.active).?;
+    formatter.pin_offsets = .{ .alloc = alloc, .entries = &entries };
+    try formatter.format(&builder.writer);
+
+    try std.testing.expectEqual(@as(?usize, null), entries[0].offset);
+}
+
+test "PageListFormatter pin_offsets matches with or without pin_map" {
+    const alloc = std.testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("AB\nCD");
+
+    const pages = &t.screens.active.pages;
+    const watched = pages.pin(.{ .active = .{ .x = 1, .y = 1 } }).?;
+
+    const with_pin_map: ?usize = blk: {
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        var pin_map: std.ArrayList(Pin) = .empty;
+        defer pin_map.deinit(alloc);
+        var entries = [_]PinOffset{.{ .pin = watched }};
+
+        var formatter: PageListFormatter = .init(pages, .plain);
+        formatter.top_left = pages.getTopLeft(.active);
+        formatter.bottom_right = pages.getBottomRight(.active).?;
+        formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+        formatter.pin_offsets = .{ .alloc = alloc, .entries = &entries };
+        try formatter.format(&builder.writer);
+        break :blk entries[0].offset;
+    };
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    var entries = [_]PinOffset{.{ .pin = watched }};
+
+    var formatter: PageListFormatter = .init(pages, .plain);
+    formatter.top_left = pages.getTopLeft(.active);
+    formatter.bottom_right = pages.getBottomRight(.active).?;
+    formatter.pin_offsets = .{ .alloc = alloc, .entries = &entries };
+    try formatter.format(&builder.writer);
+
+    try std.testing.expectEqual(with_pin_map, entries[0].offset);
 }
