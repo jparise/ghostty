@@ -209,46 +209,7 @@ extension Ghostty {
         // The cached contents of the screen.
         private(set) var cachedScreenContents: CachedValue<String>
         private(set) var cachedVisibleContents: CachedValue<String>
-
-        /// Snapshot of the full screen text with viewport position
-        /// and line-start offsets precomputed in UTF-16 space (NSRange
-        /// semantics).
-        struct ScreenText: Equatable {
-            static let empty = ScreenText(
-                text: "",
-                viewportRange: NSRange(location: 0, length: 0),
-                utf16Length: 0,
-                lineStarts: [0]
-            )
-
-            let text: String
-            let viewportRange: NSRange
-            let utf16Length: Int
-
-            /// UTF-16 offsets of the start of each line. Always
-            /// non-empty: index 0 is 0 even for an empty string.
-            let lineStarts: [Int]
-
-            /// Line number (0-based) containing the given UTF-16
-            /// offset. Out-of-range offsets clamp to the nearest
-            /// valid position.
-            func line(at index: Int) -> Int {
-                let clamped = max(0, min(index, utf16Length))
-                // Upper-bound search over lineStarts.
-                var lo = 0
-                var hi = lineStarts.count
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2
-                    if lineStarts[mid] <= clamped {
-                        lo = mid + 1
-                    } else {
-                        hi = mid
-                    }
-                }
-                return lo - 1
-            }
-        }
-        private(set) var cachedScreenText: CachedValue<ScreenText>
+        private(set) var cachedScreenText: CachedValue<OSSurfaceView.ScreenText>
 
         /// Event monitor (see individual events for why)
         private var eventMonitor: Any?
@@ -328,7 +289,7 @@ extension Ghostty {
                 }
                 defer { ghostty_surface_free_screen_text(surface, &info) }
                 guard let cString = info.text else { return .empty }
-                return ScreenText(
+                return .init(
                     text: String(cString: cString),
                     viewportStartByte: Int(info.viewport_start),
                     viewportEndByte: Int(info.viewport_end)
@@ -2311,60 +2272,6 @@ extension Ghostty.SurfaceView {
 }
 
 // MARK: Accessibility
-
-extension Ghostty.SurfaceView.ScreenText {
-    /// Build from a UTF-8 string and the byte offsets that delimit
-    /// the viewport, translating to UTF-16 / NSRange space.
-    init(
-        text: String,
-        viewportStartByte: Int,
-        viewportEndByte: Int
-    ) {
-        let utf8 = text.utf8
-        let utf16Length = text.utf16.count
-
-        // Convert the viewport from UTF-8 bytes to UTF-16 offsets.
-        let viewportStart = utf8.index(
-            utf8.startIndex, offsetBy: viewportStartByte, limitedBy: utf8.endIndex
-        )?.utf16Offset(in: text) ?? utf16Length
-        let viewportEnd = max(viewportStart, utf8.index(
-            utf8.startIndex, offsetBy: viewportEndByte, limitedBy: utf8.endIndex
-        )?.utf16Offset(in: text) ?? utf16Length)
-
-        // getLineStart's contentsEnd tells us whether the line ended
-        // with a terminator — including at end-of-buffer, where a
-        // trailing terminator means an extra empty line AX clients can
-        // navigate to. Every Unicode line terminator (LF, CR, CRLF,
-        // NEL, LS, PS) counts.
-        let string = text as NSString
-        var lineStarts: [Int] = [0]
-        var cursor = 0
-        while cursor < utf16Length {
-            var start = 0
-            var end = 0
-            var contentsEnd = 0
-            string.getLineStart(
-                &start,
-                end: &end,
-                contentsEnd: &contentsEnd,
-                for: NSRange(location: cursor, length: 0)
-            )
-            if end <= cursor { break }
-            if contentsEnd < end { lineStarts.append(end) }
-            cursor = end
-        }
-
-        self.init(
-            text: text,
-            viewportRange: NSRange(
-                location: viewportStart,
-                length: viewportEnd - viewportStart),
-            utf16Length: utf16Length,
-            lineStarts: lineStarts
-        )
-    }
-
-}
 
 extension Ghostty.SurfaceView {
     /// Indicates that this view should be exposed to accessibility tools like VoiceOver.
