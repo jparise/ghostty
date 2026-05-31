@@ -210,6 +210,46 @@ extension Ghostty {
         private(set) var cachedScreenContents: CachedValue<String>
         private(set) var cachedVisibleContents: CachedValue<String>
 
+        /// Snapshot of the full screen text with viewport position
+        /// and line-start offsets precomputed in UTF-16 space (NSRange
+        /// semantics).
+        struct ScreenText: Equatable {
+            static let empty = ScreenText(
+                text: "",
+                viewportRange: NSRange(location: 0, length: 0),
+                utf16Length: 0,
+                lineStarts: [0]
+            )
+
+            let text: String
+            let viewportRange: NSRange
+            let utf16Length: Int
+
+            /// UTF-16 offsets of the start of each line. Always
+            /// non-empty: index 0 is 0 even for an empty string.
+            let lineStarts: [Int]
+
+            /// Line number (0-based) containing the given UTF-16
+            /// offset. Out-of-range offsets clamp to the nearest
+            /// valid position.
+            func line(at index: Int) -> Int {
+                let clamped = max(0, min(index, utf16Length))
+                // Upper-bound search over lineStarts.
+                var lo = 0
+                var hi = lineStarts.count
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2
+                    if lineStarts[mid] <= clamped {
+                        lo = mid + 1
+                    } else {
+                        hi = mid
+                    }
+                }
+                return lo - 1
+            }
+        }
+        private(set) var cachedScreenText: CachedValue<ScreenText>
+
         /// Event monitor (see individual events for why)
         private var eventMonitor: Any?
 
@@ -231,6 +271,7 @@ extension Ghostty {
             // fix at some point.
             self.cachedScreenContents = .init(duration: .milliseconds(500)) { "" }
             self.cachedVisibleContents = self.cachedScreenContents
+            self.cachedScreenText = .init(duration: .milliseconds(500)) { .empty }
 
             // Initialize with some default frame size. The important thing is that this
             // is non-zero so that our layer bounds are non-zero so that our renderer
@@ -277,6 +318,21 @@ extension Ghostty {
                 guard ghostty_surface_read_text(surface, sel, &text) else { return "" }
                 defer { ghostty_surface_free_text(surface, &text) }
                 return String(cString: text.text)
+            }
+            cachedScreenText = .init(duration: .milliseconds(500)) { [weak self] in
+                guard let self else { return .empty }
+                guard let surface = self.surface else { return .empty }
+                var info = ghostty_screen_text_s()
+                guard ghostty_surface_read_screen(surface, &info) else {
+                    return .empty
+                }
+                defer { ghostty_surface_free_screen_text(surface, &info) }
+                guard let cString = info.text else { return .empty }
+                return ScreenText(
+                    text: String(cString: cString),
+                    viewportStartByte: Int(info.viewport_start),
+                    viewportEndByte: Int(info.viewport_end)
+                )
             }
 
             // Set a timer to show the ghost emoji after 500ms if no title is set
@@ -2256,6 +2312,60 @@ extension Ghostty.SurfaceView {
 
 // MARK: Accessibility
 
+extension Ghostty.SurfaceView.ScreenText {
+    /// Build from a UTF-8 string and the byte offsets that delimit
+    /// the viewport, translating to UTF-16 / NSRange space.
+    init(
+        text: String,
+        viewportStartByte: Int,
+        viewportEndByte: Int
+    ) {
+        let utf8 = text.utf8
+        let utf16Length = text.utf16.count
+
+        // Convert the viewport from UTF-8 bytes to UTF-16 offsets.
+        let viewportStart = utf8.index(
+            utf8.startIndex, offsetBy: viewportStartByte, limitedBy: utf8.endIndex
+        )?.utf16Offset(in: text) ?? utf16Length
+        let viewportEnd = max(viewportStart, utf8.index(
+            utf8.startIndex, offsetBy: viewportEndByte, limitedBy: utf8.endIndex
+        )?.utf16Offset(in: text) ?? utf16Length)
+
+        // getLineStart's contentsEnd tells us whether the line ended
+        // with a terminator — including at end-of-buffer, where a
+        // trailing terminator means an extra empty line AX clients can
+        // navigate to. Every Unicode line terminator (LF, CR, CRLF,
+        // NEL, LS, PS) counts.
+        let string = text as NSString
+        var lineStarts: [Int] = [0]
+        var cursor = 0
+        while cursor < utf16Length {
+            var start = 0
+            var end = 0
+            var contentsEnd = 0
+            string.getLineStart(
+                &start,
+                end: &end,
+                contentsEnd: &contentsEnd,
+                for: NSRange(location: cursor, length: 0)
+            )
+            if end <= cursor { break }
+            if contentsEnd < end { lineStarts.append(end) }
+            cursor = end
+        }
+
+        self.init(
+            text: text,
+            viewportRange: NSRange(
+                location: viewportStart,
+                length: viewportEnd - viewportStart),
+            utf16Length: utf16Length,
+            lineStarts: lineStarts
+        )
+    }
+
+}
+
 extension Ghostty.SurfaceView {
     /// Indicates that this view should be exposed to accessibility tools like VoiceOver.
     /// By returning true, we make the terminal surface accessible to screen readers
@@ -2277,14 +2387,41 @@ extension Ghostty.SurfaceView {
     }
 
     override func accessibilityValue() -> Any? {
-        return cachedScreenContents.get()
+        return cachedScreenText.get().text
     }
 
-    /// Returns the range of text that is currently selected in the terminal.
-    /// This allows VoiceOver and other assistive technologies to understand
-    /// what text the user has selected.
+    /// UTF-16 NSRange of the current selection within the cached
+    /// screen text, or `NSRange(NSNotFound, 0)` when no selection
+    /// exists or the selection text appears more than once.
     override func accessibilitySelectedTextRange() -> NSRange {
-        return selectedRange()
+        guard let selected = accessibilitySelectedText(), !selected.isEmpty else {
+            return NSRange(location: 0, length: 0)
+        }
+        return Ghostty.SurfaceView.accessibilityRange(
+            of: selected, in: cachedScreenText.get().text)
+    }
+
+    /// UTF-16 NSRange of `needle` inside `haystack` when there is
+    /// exactly one occurrence. Returns `NSRange(NSNotFound, 0)` for
+    /// no match or a multiple-occurrence ambiguous match.
+    static func accessibilityRange(of needle: String, in haystack: String) -> NSRange {
+        guard !needle.isEmpty else { return NSRange(location: NSNotFound, length: 0) }
+        let string = haystack as NSString
+        let first = string.range(of: needle)
+        guard first.location != NSNotFound else {
+            return NSRange(location: NSNotFound, length: 0)
+        }
+        let searchStart = first.location + first.length
+        let rest = NSRange(
+            location: searchStart,
+            length: string.length - searchStart)
+        if rest.length > 0 {
+            let second = string.range(of: needle, range: rest)
+            if second.location != NSNotFound {
+                return NSRange(location: NSNotFound, length: 0)
+            }
+        }
+        return first
     }
 
     /// Returns the currently selected text as a string.
@@ -2301,32 +2438,23 @@ extension Ghostty.SurfaceView {
         return str.isEmpty ? nil : str
     }
 
-    /// Returns the number of characters in the terminal content.
-    /// This helps assistive technologies understand the size of the content.
     override func accessibilityNumberOfCharacters() -> Int {
-        let content = cachedScreenContents.get()
-        return content.count
+        return cachedScreenText.get().utf16Length
     }
 
-    /// Returns the visible character range for the terminal.
-    /// For terminals, we typically show all content as visible.
     override func accessibilityVisibleCharacterRange() -> NSRange {
-        let content = cachedScreenContents.get()
-        return NSRange(location: 0, length: content.count)
+        return cachedScreenText.get().viewportRange
     }
 
-    /// Returns the line number for a given character index.
-    /// This helps assistive technologies navigate by line.
+    /// Logical/paragraph-line semantics matching `NSTextView`: lines are
+    /// delimited by hard newlines and soft-wrap is invisible to line
+    /// navigation (a soft-wrapped line is one line).
     override func accessibilityLine(for index: Int) -> Int {
-        let content = cachedScreenContents.get()
-        let substring = String(content.prefix(index))
-        return substring.components(separatedBy: .newlines).count - 1
+        return cachedScreenText.get().line(at: index)
     }
 
-    /// Returns a substring for the given range.
-    /// This allows assistive technologies to read specific portions of the content.
     override func accessibilityString(for range: NSRange) -> String? {
-        let content = cachedScreenContents.get()
+        let content = cachedScreenText.get().text
         guard let swiftRange = Range(range, in: content) else { return nil }
         return String(content[swiftRange])
     }

@@ -2511,6 +2511,82 @@ pub fn selectionString(
     return text;
 }
 
+/// Full screen text (scrollback + active) with the UTF-8 byte range
+/// delimiting the visible viewport.
+pub const ScreenText = struct {
+    text: [:0]const u8,
+    viewport: Viewport,
+
+    pub const Viewport = struct {
+        start: usize,
+        end: usize,
+    };
+
+    /// Slice of `text` containing the visible bytes
+    pub fn visible(self: ScreenText) []const u8 {
+        return self.text[self.viewport.start..self.viewport.end];
+    }
+
+    pub fn deinit(self: ScreenText, alloc: Allocator) void {
+        alloc.free(self.text);
+    }
+};
+
+pub fn screenText(
+    self: *Screen,
+    alloc: Allocator,
+) Allocator.Error!ScreenText {
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+
+    var pins: std.ArrayList(Pin) = .empty;
+    defer pins.deinit(alloc);
+
+    var formatter: ScreenFormatter = .init(self, .{
+        .emit = .plain,
+        .unwrap = true,
+        .trim = false,
+    });
+    formatter.pin_map = .{ .alloc = alloc, .map = &pins };
+    formatter.format(&aw.writer) catch return error.OutOfMemory;
+
+    const text = try aw.toOwnedSliceSentinel(0);
+    errdefer alloc.free(text);
+
+    // The formatter's contract: one Pin per byte written.
+    assert(pins.items.len == text.len);
+
+    // pins.items is monotonic in Pin order (the formatter emits in
+    // document order). Pin.before is O(pages) for cross-node
+    // comparisons, so we use binary search rather than a linear scan.
+    const start = std.sort.partitionPoint(
+        Pin,
+        pins.items,
+        self.pages.getTopLeft(.viewport),
+        struct {
+            fn pred(ctx: Pin, pin: Pin) bool {
+                return pin.before(ctx);
+            }
+        }.pred,
+    );
+    const end = start + std.sort.partitionPoint(
+        Pin,
+        pins.items[start..],
+        self.pages.getBottomRight(.viewport).?,
+        struct {
+            fn pred(ctx: Pin, pin: Pin) bool {
+                return !ctx.before(pin);
+            }
+        }.pred,
+    );
+
+    return .{
+        .text = text,
+        // Preserve `start <= end` when the viewport sits past end-of-text.
+        .viewport = .{ .start = @min(start, end), .end = end },
+    };
+}
+
 pub const SelectLine = struct {
     /// The pin of some part of the line to select.
     pin: Pin,
@@ -8386,8 +8462,10 @@ test "Screen: selectWord" {
 
     // Default boundary codepoints for word selection
     const boundary_codepoints = &[_]u21{
-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+        0,     ' ', '\t', '\'', '"',
+        '│', '`', '|',  ':',  ';',
+        ',',   '(', ')',  '[',  ']',
+        '{',   '}', '<',  '>',  '$',
     };
 
     // Outside of active area
@@ -8507,8 +8585,10 @@ test "Screen: selectWord across soft-wrap" {
 
     // Default boundary codepoints for word selection
     const boundary_codepoints = &[_]u21{
-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+        0,     ' ', '\t', '\'', '"',
+        '│', '`', '|',  ':',  ';',
+        ',',   '(', ')',  '[',  ']',
+        '{',   '}', '<',  '>',  '$',
     };
 
     {
@@ -8579,8 +8659,10 @@ test "Screen: selectWord whitespace across soft-wrap" {
 
     // Default boundary codepoints for word selection
     const boundary_codepoints = &[_]u21{
-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+        0,     ' ', '\t', '\'', '"',
+        '│', '`', '|',  ':',  ';',
+        ',',   '(', ')',  '[',  ']',
+        '{',   '}', '<',  '>',  '$',
     };
 
     // Going forward
@@ -8641,8 +8723,10 @@ test "Screen: selectWord with character boundary" {
 
     // Default boundary codepoints for word selection
     const boundary_codepoints = &[_]u21{
-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+        0,     ' ', '\t', '\'', '"',
+        '│', '`', '|',  ':',  ';',
+        ',',   '(', ')',  '[',  ']',
+        '{',   '}', '<',  '>',  '$',
     };
 
     const cases = [_][]const u8{
@@ -10481,4 +10565,87 @@ test "Screen: promptClickMove click right of input cursor on last char" {
 
     try testing.expectEqual(@as(usize, 1), result.right);
     try testing.expectEqual(@as(usize, 0), result.left);
+}
+
+test "Screen: screenText viewport at bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 100 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL\n4MNOP\n5QRST");
+
+    const result = try s.screenText(alloc);
+    defer result.deinit(alloc);
+
+    try testing.expectEqualStrings("1ABCD\n2EFGH\n3IJKL\n4MNOP\n5QRST", result.text);
+    try testing.expectEqualStrings("3IJKL\n4MNOP\n5QRST", result.visible());
+}
+
+test "Screen: screenText viewport scrolled to top" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 100 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL\n4MNOP\n5QRST");
+
+    s.scroll(.{ .top = {} });
+
+    const result = try s.screenText(alloc);
+    defer result.deinit(alloc);
+
+    // The trailing newline of the last viewport row is mapped to the
+    // viewport row, not to the row after, so it sits inside the range.
+    try testing.expectEqual(@as(usize, 0), result.viewport.start);
+    try testing.expectEqualStrings("1ABCD\n2EFGH\n3IJKL\n", result.visible());
+}
+
+test "Screen: screenText viewport scrolled mid-buffer" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 100 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL\n4MNOP\n5QRST");
+
+    s.scroll(.{ .delta_row = -1 });
+
+    const result = try s.screenText(alloc);
+    defer result.deinit(alloc);
+
+    try testing.expectEqualStrings("2EFGH\n3IJKL\n4MNOP\n", result.visible());
+}
+
+test "Screen: screenText empty screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 100 });
+    defer s.deinit();
+
+    const result = try s.screenText(alloc);
+    defer result.deinit(alloc);
+
+    try testing.expectEqualStrings("", result.text);
+    try testing.expectEqual(@as(usize, 0), result.viewport.start);
+    try testing.expectEqual(@as(usize, 0), result.viewport.end);
+}
+
+test "Screen: screenText wide character at viewport boundary" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 100 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n好kAB\n4MNOP\n5QRST");
+
+    const result = try s.screenText(alloc);
+    defer result.deinit(alloc);
+
+    // Viewport offsets must land on UTF-8 codepoint boundaries.
+    try testing.expect(result.text[result.viewport.start] & 0xC0 != 0x80);
+    if (result.viewport.end < result.text.len) {
+        try testing.expect(result.text[result.viewport.end] & 0xC0 != 0x80);
+    }
 }
