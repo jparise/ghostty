@@ -1311,6 +1311,8 @@ pub const CAPI = struct {
         text_len: usize,
         viewport_start: usize,
         viewport_end: usize,
+        selection_start: usize,
+        selection_end: usize,
 
         pub fn deinit(self: *ScreenText) void {
             if (self.text) |ptr| {
@@ -1696,10 +1698,11 @@ pub const CAPI = struct {
     }
 
     /// Read the full screen text along with the UTF-8 byte offsets
-    /// that delimit the visible viewport, as a self-consistent
-    /// snapshot. On success free with ghostty_surface_free_screen_text.
-    /// On failure `*result` is zero-initialized so calling
-    /// ghostty_surface_free_screen_text on it is a safe no-op.
+    /// that delimit the visible viewport and (if `has_selection`) the
+    /// active selection, as a self-consistent snapshot. On success
+    /// free with ghostty_surface_free_screen_text. On failure `*result`
+    /// is zero-initialized so calling ghostty_surface_free_screen_text
+    /// on it is a safe no-op.
     export fn ghostty_surface_read_screen(
         surface: *Surface,
         result: *ScreenText,
@@ -1713,6 +1716,8 @@ pub const CAPI = struct {
                 .text_len = 0,
                 .viewport_start = 0,
                 .viewport_end = 0,
+                .selection_start = 0,
+                .selection_end = 0,
             };
             return false;
         };
@@ -1721,6 +1726,8 @@ pub const CAPI = struct {
             .text_len = screen_text.text.len,
             .viewport_start = screen_text.viewport.start,
             .viewport_end = screen_text.viewport.end,
+            .selection_start = if (screen_text.selection) |s| s.start else 0,
+            .selection_end = if (screen_text.selection) |s| s.end else 0,
         };
         return true;
     }

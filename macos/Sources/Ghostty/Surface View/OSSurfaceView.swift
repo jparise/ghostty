@@ -49,19 +49,21 @@ extension Ghostty {
         /// True when the surface is in readonly mode.
         @Published private(set) var readonly: Bool = false
 
-        /// Snapshot of the full screen text with viewport position
-        /// and line-start offsets precomputed in UTF-16 space (NSRange
-        /// semantics).
+        /// Snapshot of the full screen text with viewport position,
+        /// optional selection range, and line-start offsets precomputed
+        /// in UTF-16 space (NSRange semantics).
         struct ScreenText: Equatable {
             static let empty = ScreenText(
                 text: "",
                 viewportRange: NSRange(location: 0, length: 0),
+                selectionRange: nil,
                 utf16Length: 0,
                 lineStarts: [0]
             )
 
             let text: String
             let viewportRange: NSRange
+            let selectionRange: NSRange?
             let utf16Length: Int
 
             /// UTF-16 offsets of the start of each line. Always
@@ -221,22 +223,35 @@ extension Ghostty.OSSurfaceView {
 
 extension Ghostty.OSSurfaceView.ScreenText {
     /// Build from a UTF-8 string and the byte offsets that delimit
-    /// the viewport, translating to UTF-16 / NSRange space.
+    /// the viewport and (optionally) the selection, translating to
+    /// UTF-16 / NSRange space. A zero-length selection input means
+    /// "no selection."
     init(
         text: String,
         viewportStartByte: Int,
-        viewportEndByte: Int
+        viewportEndByte: Int,
+        selectionStartByte: Int = 0,
+        selectionEndByte: Int = 0
     ) {
         let utf8 = text.utf8
         let utf16Length = text.utf16.count
 
-        // Convert the viewport from UTF-8 bytes to UTF-16 offsets.
-        let viewportStart = utf8.index(
-            utf8.startIndex, offsetBy: viewportStartByte, limitedBy: utf8.endIndex
-        )?.utf16Offset(in: text) ?? utf16Length
-        let viewportEnd = max(viewportStart, utf8.index(
-            utf8.startIndex, offsetBy: viewportEndByte, limitedBy: utf8.endIndex
-        )?.utf16Offset(in: text) ?? utf16Length)
+        // Convert a UTF-8 byte range from the Zig side to a UTF-16
+        // NSRange, clamping out-of-range offsets to end-of-text.
+        func range(from startByte: Int, to endByte: Int) -> NSRange {
+            let start = utf8.index(
+                utf8.startIndex, offsetBy: startByte, limitedBy: utf8.endIndex
+            )?.utf16Offset(in: text) ?? utf16Length
+            let end = max(start, utf8.index(
+                utf8.startIndex, offsetBy: endByte, limitedBy: utf8.endIndex
+            )?.utf16Offset(in: text) ?? utf16Length)
+            return NSRange(location: start, length: end - start)
+        }
+
+        let viewportRange = range(from: viewportStartByte, to: viewportEndByte)
+        let selectionRange: NSRange? = selectionStartByte < selectionEndByte
+            ? range(from: selectionStartByte, to: selectionEndByte)
+            : nil
 
         // getLineStart's contentsEnd tells us whether the line ended
         // with a terminator — including at end-of-buffer, where a
@@ -263,9 +278,8 @@ extension Ghostty.OSSurfaceView.ScreenText {
 
         self.init(
             text: text,
-            viewportRange: NSRange(
-                location: viewportStart,
-                length: viewportEnd - viewportStart),
+            viewportRange: viewportRange,
+            selectionRange: selectionRange,
             utf16Length: utf16Length,
             lineStarts: lineStarts
         )

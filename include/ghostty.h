@@ -419,6 +419,8 @@ typedef struct {
   uintptr_t text_len;
   uintptr_t viewport_start;
   uintptr_t viewport_end;
+  uintptr_t selection_start;
+  uintptr_t selection_end;
 } ghostty_screen_text_s;
 
 typedef enum {

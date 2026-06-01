@@ -292,7 +292,9 @@ extension Ghostty {
                 return .init(
                     text: String(cString: cString),
                     viewportStartByte: Int(info.viewport_start),
-                    viewportEndByte: Int(info.viewport_end)
+                    viewportEndByte: Int(info.viewport_end),
+                    selectionStartByte: Int(info.selection_start),
+                    selectionEndByte: Int(info.selection_end)
                 )
             }
 
@@ -2297,38 +2299,8 @@ extension Ghostty.SurfaceView {
         return cachedScreenText.get().text
     }
 
-    /// UTF-16 NSRange of the current selection within the cached
-    /// screen text, or `NSRange(NSNotFound, 0)` when no selection
-    /// exists or the selection text appears more than once.
     override func accessibilitySelectedTextRange() -> NSRange {
-        guard let selected = accessibilitySelectedText(), !selected.isEmpty else {
-            return NSRange(location: 0, length: 0)
-        }
-        return Ghostty.SurfaceView.accessibilityRange(
-            of: selected, in: cachedScreenText.get().text)
-    }
-
-    /// UTF-16 NSRange of `needle` inside `haystack` when there is
-    /// exactly one occurrence. Returns `NSRange(NSNotFound, 0)` for
-    /// no match or a multiple-occurrence ambiguous match.
-    static func accessibilityRange(of needle: String, in haystack: String) -> NSRange {
-        guard !needle.isEmpty else { return NSRange(location: NSNotFound, length: 0) }
-        let string = haystack as NSString
-        let first = string.range(of: needle)
-        guard first.location != NSNotFound else {
-            return NSRange(location: NSNotFound, length: 0)
-        }
-        let searchStart = first.location + first.length
-        let rest = NSRange(
-            location: searchStart,
-            length: string.length - searchStart)
-        if rest.length > 0 {
-            let second = string.range(of: needle, range: rest)
-            if second.location != NSNotFound {
-                return NSRange(location: NSNotFound, length: 0)
-            }
-        }
-        return first
+        return cachedScreenText.get().selectionRange ?? NSRange(location: NSNotFound, length: 0)
     }
 
     /// Returns the currently selected text as a string.
