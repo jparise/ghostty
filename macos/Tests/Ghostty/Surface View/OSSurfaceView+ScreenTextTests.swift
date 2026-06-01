@@ -3,8 +3,10 @@ import Foundation
 import Testing
 
 struct OSSurfaceViewScreenTextTests {
+    typealias ScreenText = Ghostty.OSSurfaceView.ScreenText
+
     @Test func emptyTextProducesEmpty() {
-        let screenText = Ghostty.OSSurfaceView.ScreenText(
+        let screenText = ScreenText(
             text: "",
             viewportStartByte: 0,
             viewportEndByte: 0
@@ -13,7 +15,7 @@ struct OSSurfaceViewScreenTextTests {
     }
 
     @Test func asciiOffsetsAreIdentity() {
-        let screenText = Ghostty.OSSurfaceView.ScreenText(
+        let screenText = ScreenText(
             text: "hello\nworld",
             viewportStartByte: 6,
             viewportEndByte: 11
@@ -26,7 +28,7 @@ struct OSSurfaceViewScreenTextTests {
         // U+1F600 ("😀") is 4 bytes in UTF-8 and a surrogate pair (two
         // code units) in UTF-16.
         let text = "a😀b"
-        let screenText = Ghostty.OSSurfaceView.ScreenText(
+        let screenText = ScreenText(
             text: text,
             viewportStartByte: 0,
             viewportEndByte: text.utf8.count
@@ -38,7 +40,7 @@ struct OSSurfaceViewScreenTextTests {
 
     @Test func viewportRangeSkipsAcrossSurrogatePair() {
         let text = "a😀b"
-        let screenText = Ghostty.OSSurfaceView.ScreenText(
+        let screenText = ScreenText(
             text: text,
             viewportStartByte: 5,  // byte index of "b"
             viewportEndByte: 6     // byte index past "b"
@@ -48,7 +50,7 @@ struct OSSurfaceViewScreenTextTests {
 
     @Test func cjkCharacterCountsAsOneUTF16Unit() {
         let text = "好"
-        let screenText = Ghostty.OSSurfaceView.ScreenText(
+        let screenText = ScreenText(
             text: text,
             viewportStartByte: 0,
             viewportEndByte: text.utf8.count
@@ -58,7 +60,7 @@ struct OSSurfaceViewScreenTextTests {
     }
 
     @Test func viewportPastEndClampsToEndOfText() {
-        let screenText = Ghostty.OSSurfaceView.ScreenText(
+        let screenText = ScreenText(
             text: "hi",
             viewportStartByte: 10,
             viewportEndByte: 20
@@ -70,7 +72,7 @@ struct OSSurfaceViewScreenTextTests {
     @Test func reversedOffsetsCollapseToZeroLength() {
         // A negative NSRange.length is meaningless to AX clients; the
         // init normalizes to a zero-length range at start.
-        let screenText = Ghostty.OSSurfaceView.ScreenText(
+        let screenText = ScreenText(
             text: "abcdef",
             viewportStartByte: 4,
             viewportEndByte: 2
@@ -85,7 +87,7 @@ struct OSSurfaceViewScreenTextTests {
             from: text.utf8.startIndex,
             to: text.range(of: viewport)!.lowerBound.samePosition(in: text.utf8)!
         )
-        let screenText = Ghostty.OSSurfaceView.ScreenText(
+        let screenText = ScreenText(
             text: text,
             viewportStartByte: start,
             viewportEndByte: start + viewport.utf8.count
@@ -107,7 +109,7 @@ struct OSSurfaceViewScreenTextTests {
         ("a\nb\n", [0, 2, 4]),
     ])
     func lineStarts(text: String, expected: [Int]) {
-        let screenText = Ghostty.OSSurfaceView.ScreenText(
+        let screenText = ScreenText(
             text: text, viewportStartByte: 0, viewportEndByte: text.utf8.count
         )
         #expect(screenText.lineStarts == expected)
@@ -123,14 +125,14 @@ struct OSSurfaceViewScreenTextTests {
         (100, 2) // way past end still clamps
     ])
     func lineAtIndex(index: Int, expected: Int) {
-        let screenText = Ghostty.OSSurfaceView.ScreenText(
+        let screenText = ScreenText(
             text: "a\nb\nc", viewportStartByte: 0, viewportEndByte: 5
         )
         #expect(screenText.line(at: index) == expected)
     }
 
     @Test func lineAtNegativeIndexClampsToZero() {
-        let screenText = Ghostty.OSSurfaceView.ScreenText(
+        let screenText = ScreenText(
             text: "a\nb", viewportStartByte: 0, viewportEndByte: 3
         )
         #expect(screenText.line(at: -1) == 0)
@@ -139,9 +141,53 @@ struct OSSurfaceViewScreenTextTests {
     @Test func lineForEmptyText() {
         // Past-end indices clamp to line 0 when the text is empty;
         // the in-range `at: 0` case is covered by lineAtIndex.
-        let screenText = Ghostty.OSSurfaceView.ScreenText(
+        let screenText = ScreenText(
             text: "", viewportStartByte: 0, viewportEndByte: 0
         )
         #expect(screenText.line(at: 100) == 0)
+    }
+
+    // MARK: selectionRange
+
+    @Test(arguments: [
+        (2, 2),  // zero-length (also the default-args case)
+        (4, 2),  // reversed
+    ])
+    func selectionMustBePositive(startByte: Int, endByte: Int) {
+        let screenText = ScreenText(
+            text: "hello",
+            viewportStartByte: 0, viewportEndByte: 5,
+            selectionStartByte: startByte, selectionEndByte: endByte
+        )
+        #expect(screenText.selectionRange == nil)
+    }
+
+    @Test func selectionAsciiOffsetsAreIdentity() {
+        let screenText = ScreenText(
+            text: "hello world",
+            viewportStartByte: 0, viewportEndByte: 11,
+            selectionStartByte: 6, selectionEndByte: 11
+        )
+        #expect(screenText.selectionRange == NSRange(location: 6, length: 5))
+    }
+
+    @Test func selectionAcrossSurrogatePair() {
+        let text = "a😀b"
+        let screenText = ScreenText(
+            text: text,
+            viewportStartByte: 0, viewportEndByte: text.utf8.count,
+            selectionStartByte: 1, selectionEndByte: 5  // "😀"
+        )
+        // "😀" occupies a UTF-16 surrogate pair (locations 1..3).
+        #expect(screenText.selectionRange == NSRange(location: 1, length: 2))
+    }
+
+    @Test func selectionPastEndClampsToEndOfText() {
+        let screenText = ScreenText(
+            text: "hi",
+            viewportStartByte: 0, viewportEndByte: 2,
+            selectionStartByte: 10, selectionEndByte: 20
+        )
+        #expect(screenText.selectionRange == NSRange(location: 2, length: 0))
     }
 }
