@@ -61,31 +61,27 @@ pub const ShellIntegrationFeatures = struct {
             const trimmed = std.mem.trim(u8, part_raw, cli.args.whitespace);
 
             // Handle cursor[:shape[:style]] syntax
-            if (std.mem.eql(u8, trimmed, "cursor") or
-                std.mem.startsWith(u8, trimmed, "cursor:"))
-            {
-                var cursor_iter = std.mem.splitScalar(u8, trimmed, ':');
-                _ = cursor_iter.next(); // skip "cursor"
+            if (std.mem.eql(u8, trimmed, "cursor")) {
+                result.cursor = .{};
+                continue;
+            } else if (std.mem.cutPrefix(u8, trimmed, "cursor:")) |cursor_value| {
+                var cursor_iter = std.mem.splitScalar(u8, cursor_value, ':');
+                const shape = cursor_iter.next().?;
 
-                // Parse shape (if present)
-                if (cursor_iter.next()) |shape| {
-                    // For convenience, "blink" or "steady" alone implies bar (default)
-                    if (std.mem.eql(u8, shape, "blink")) {
-                        result.cursor.shape = .bar;
-                        result.cursor.style = .blink;
-                    } else if (std.mem.eql(u8, shape, "steady")) {
-                        result.cursor.shape = .bar;
-                        result.cursor.style = .steady;
-                    } else {
-                        result.cursor.shape = std.meta.stringToEnum(Cursor.Shape, shape) orelse return error.InvalidValue;
-                    }
-
-                    // Parse style (if present)
-                    if (cursor_iter.next()) |style| {
-                        result.cursor.style = std.meta.stringToEnum(Cursor.Style, style) orelse return error.InvalidValue;
-                    }
+                // For convenience, "blink" or "steady" alone implies bar (default)
+                if (std.mem.eql(u8, shape, "blink")) {
+                    result.cursor.shape = .bar;
+                    result.cursor.style = .blink;
+                } else if (std.mem.eql(u8, shape, "steady")) {
+                    result.cursor.shape = .bar;
+                    result.cursor.style = .steady;
                 } else {
-                    result.cursor = .{};
+                    result.cursor.shape = std.meta.stringToEnum(Cursor.Shape, shape) orelse return error.InvalidValue;
+                }
+
+                // Parse style (if present)
+                if (cursor_iter.next()) |style| {
+                    result.cursor.style = std.meta.stringToEnum(Cursor.Style, style) orelse return error.InvalidValue;
                 }
                 if (cursor_iter.next() != null) return error.InvalidValue;
                 continue;
@@ -94,15 +90,10 @@ pub const ShellIntegrationFeatures = struct {
                 continue;
             }
 
-            const name, const value = part: {
-                const negation_prefix = "no-";
-                const trimmed_name = std.mem.trim(u8, part_raw, cli.args.whitespace);
-                if (std.mem.startsWith(u8, trimmed, negation_prefix)) {
-                    break :part .{ trimmed_name[negation_prefix.len..], false };
-                } else {
-                    break :part .{ trimmed_name, true };
-                }
-            };
+            const name, const value = if (std.mem.cutPrefix(u8, trimmed, "no-")) |name|
+                .{ name, false }
+            else
+                .{ trimmed, true };
 
             inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
                 if (field.type == bool and std.mem.eql(u8, field.name, name)) {
@@ -125,27 +116,15 @@ pub const ShellIntegrationFeatures = struct {
         env,
     };
 
-    pub fn format(self: ShellIntegrationFeatures, writer: *std.Io.Writer, mode: FormatMode) anyerror!void {
-        const fields = comptime fields: {
-            const all_fields = @typeInfo(ShellIntegrationFeatures).@"struct".fields;
-            var sorted: [all_fields.len]std.builtin.Type.StructField = all_fields[0..].*;
-            const SortContext = struct {
-                fn lessThan(_: @This(), a: std.builtin.Type.StructField, b: std.builtin.Type.StructField) bool {
-                    return std.ascii.orderIgnoreCase(a.name, b.name) == .lt;
-                }
-            };
-            std.mem.sortUnstable(std.builtin.Type.StructField, &sorted, SortContext{}, SortContext.lessThan);
-            break :fields sorted;
-        };
-
-        inline for (fields) |field| {
+    pub fn format(self: ShellIntegrationFeatures, writer: *std.Io.Writer, mode: FormatMode) std.Io.Writer.Error!void {
+        inline for (std.meta.fields(ShellIntegrationFeatures)) |field| {
             const enabled = switch (field.type) {
                 bool => @field(self, field.name),
                 Cursor => @field(self, field.name).shape != .disabled,
                 else => @compileError("unexpected field type in ShellIntegrationFeatures"),
             };
             if (enabled or mode == .config) {
-                if (writer.end > 0) try writer.writeByte(',');
+                if (writer.buffered().len > 0) try writer.writeByte(',');
                 if (mode == .config and !enabled) try writer.writeAll("no-");
                 try writer.writeAll(field.name);
 
@@ -196,7 +175,7 @@ pub const ShellIntegrationFeatures = struct {
         var buf: [128]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
         try self.format(&writer, .config);
-        try formatter.formatEntry([]const u8, buf[0..writer.end]);
+        try formatter.formatEntry([]const u8, writer.buffered());
     }
 
     pub fn clone(self: ShellIntegrationFeatures, _: Allocator) error{}!ShellIntegrationFeatures {
@@ -310,7 +289,7 @@ pub const ShellIntegrationFeatures = struct {
                 var buf: [128]u8 = undefined;
                 var writer: std.Io.Writer = .fixed(&buf);
                 try features.format(&writer, mode);
-                try testing.expectEqualStrings(expected, buf[0..writer.end]);
+                try testing.expectEqualStrings(expected, writer.buffered());
             }
         }.f;
 
