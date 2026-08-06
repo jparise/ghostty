@@ -45,9 +45,8 @@ pub const ShellIntegrationFeatures = struct {
         const v = input orelse return error.ValueRequired;
         var result: ShellIntegrationFeatures = .{};
 
-        // Handle "true" or "false" to toggle all features
-        if (std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "false")) {
-            const b = std.mem.eql(u8, v, "true");
+        // Handle boolean values to toggle all features
+        if (cli.args.parseBool(v)) |b| {
             result.cursor = if (b) .{} else .{ .shape = .disabled };
             inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
                 if (field.type == bool) {
@@ -55,7 +54,7 @@ pub const ShellIntegrationFeatures = struct {
                 }
             }
             return result;
-        }
+        } else |_| {}
 
         var iter = std.mem.splitSequence(u8, v, ",");
         loop: while (iter.next()) |part_raw| {
@@ -225,9 +224,9 @@ pub const ShellIntegrationFeatures = struct {
             }
         }
 
-        // Test "true" enables all features
-        {
-            const result = try ShellIntegrationFeatures.parseCLI("true");
+        // Test true values enable all features
+        inline for (.{ "1", "t", "T", "true" }) |input| {
+            const result = try ShellIntegrationFeatures.parseCLI(input);
             inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
                 switch (field.type) {
                     bool => try testing.expect(@field(result, field.name)),
@@ -240,9 +239,9 @@ pub const ShellIntegrationFeatures = struct {
             }
         }
 
-        // Test "false" disables all features
-        {
-            const result = try ShellIntegrationFeatures.parseCLI("false");
+        // Test false values disable all features
+        inline for (.{ "0", "f", "F", "false" }) |input| {
+            const result = try ShellIntegrationFeatures.parseCLI(input);
             inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
                 switch (field.type) {
                     bool => try testing.expect(!@field(result, field.name)),
