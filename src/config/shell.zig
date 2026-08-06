@@ -62,7 +62,9 @@ pub const ShellIntegrationFeatures = struct {
             const trimmed = std.mem.trim(u8, part_raw, cli.args.whitespace);
 
             // Handle cursor[:shape[:style]] syntax
-            if (std.mem.startsWith(u8, trimmed, "cursor")) {
+            if (std.mem.eql(u8, trimmed, "cursor") or
+                std.mem.startsWith(u8, trimmed, "cursor:"))
+            {
                 var cursor_iter = std.mem.splitScalar(u8, trimmed, ':');
                 _ = cursor_iter.next(); // skip "cursor"
 
@@ -86,6 +88,7 @@ pub const ShellIntegrationFeatures = struct {
                 } else {
                     result.cursor = .{};
                 }
+                if (cursor_iter.next() != null) return error.InvalidValue;
                 continue;
             } else if (std.mem.eql(u8, trimmed, "no-cursor")) {
                 result.cursor.shape = .disabled;
@@ -293,6 +296,9 @@ pub const ShellIntegrationFeatures = struct {
             try testing.expectEqual(Cursor.Shape.bar, result.cursor.shape);
             try testing.expectEqual(Cursor.Style.steady, result.cursor.style);
         }
+
+        try testing.expectError(error.InvalidValue, ShellIntegrationFeatures.parseCLI("cursorfoo"));
+        try testing.expectError(error.InvalidValue, ShellIntegrationFeatures.parseCLI("cursor:block:steady:extra"));
     }
 
     test "format" {
