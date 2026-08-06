@@ -144,10 +144,12 @@ pub const ShellIntegrationFeatures = struct {
                 Cursor => @field(self, field.name).shape != .disabled,
                 else => @compileError("unexpected field type in ShellIntegrationFeatures"),
             };
-            if (enabled) {
+            if (enabled or mode == .config) {
                 if (writer.end > 0) try writer.writeByte(',');
+                if (mode == .config and !enabled) try writer.writeAll("no-");
                 try writer.writeAll(field.name);
-                switch (field.type) {
+
+                if (enabled) switch (field.type) {
                     Cursor => {
                         const cursor = @field(self, field.name);
                         switch (mode) {
@@ -185,7 +187,7 @@ pub const ShellIntegrationFeatures = struct {
                         }
                     },
                     else => {},
-                }
+                };
             }
         }
     }
@@ -313,12 +315,12 @@ pub const ShellIntegrationFeatures = struct {
         }.f;
 
         // .config format
-        try testFormat(.{ .cursor = .{ .shape = .bar, .style = .steady }, .title = true }, .config, "cursor:bar:steady,path,title");
-        try testFormat(.{ .cursor = .{ .shape = .bar, .style = .blink }, .sudo = true }, .config, "cursor:bar:blink,path,sudo,title");
-        try testFormat(.{ .cursor = .{ .shape = .disabled }, .title = true }, .config, "path,title");
-        try testFormat(.{ .cursor = .{ .shape = .block, .style = .blink }, .title = true }, .config, "cursor:block:blink,path,title");
-        try testFormat(.{ .cursor = .{ .shape = .underline, .style = .default } }, .config, "cursor:underline,path,title");
-        try testFormat(.{ .cursor = .{ .shape = .bar, .style = .default } }, .config, "cursor:bar,path,title");
+        try testFormat(.{ .cursor = .{ .shape = .bar, .style = .steady }, .title = true }, .config, "cursor:bar:steady,path,no-ssh-env,no-ssh-terminfo,no-sudo,title");
+        try testFormat(.{ .cursor = .{ .shape = .bar, .style = .blink }, .sudo = true }, .config, "cursor:bar:blink,path,no-ssh-env,no-ssh-terminfo,sudo,title");
+        try testFormat(.{ .cursor = .{ .shape = .disabled }, .path = false, .@"ssh-env" = true, .title = false }, .config, "no-cursor,no-path,ssh-env,no-ssh-terminfo,no-sudo,no-title");
+        try testFormat(.{ .cursor = .{ .shape = .block, .style = .blink }, .title = true }, .config, "cursor:block:blink,path,no-ssh-env,no-ssh-terminfo,no-sudo,title");
+        try testFormat(.{ .cursor = .{ .shape = .underline, .style = .default } }, .config, "cursor:underline,path,no-ssh-env,no-ssh-terminfo,no-sudo,title");
+        try testFormat(.{ .cursor = .{ .shape = .bar, .style = .default } }, .config, "cursor:bar,path,no-ssh-env,no-ssh-terminfo,no-sudo,title");
 
         // .env format
         try testFormat(.{ .cursor = .{ .shape = .bar, .style = .steady }, .title = true }, .env, "cursor:6,path,title");
