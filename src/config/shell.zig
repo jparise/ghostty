@@ -48,9 +48,9 @@ pub const ShellIntegrationFeatures = struct {
         // Handle boolean values to toggle all features
         if (cli.args.parseBool(v)) |b| {
             result.cursor = if (b) .{} else .{ .shape = .disabled };
-            inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
-                if (field.type == bool) {
-                    @field(result, field.name) = b;
+            inline for (@typeInfo(ShellIntegrationFeatures).@"struct".field_names, @typeInfo(ShellIntegrationFeatures).@"struct".field_types) |field, field_type| {
+                if (field_type == bool) {
+                    @field(result, field) = b;
                 }
             }
             return result;
@@ -61,31 +61,27 @@ pub const ShellIntegrationFeatures = struct {
             const trimmed = std.mem.trim(u8, part_raw, cli.args.whitespace);
 
             // Handle cursor[:shape[:style]] syntax
-            if (std.mem.eql(u8, trimmed, "cursor") or
-                std.mem.startsWith(u8, trimmed, "cursor:"))
-            {
-                var cursor_iter = std.mem.splitScalar(u8, trimmed, ':');
-                _ = cursor_iter.next(); // skip "cursor"
+            if (std.mem.eql(u8, trimmed, "cursor")) {
+                result.cursor = .{};
+                continue;
+            } else if (std.mem.cutPrefix(u8, trimmed, "cursor:")) |cursor_value| {
+                var cursor_iter = std.mem.splitScalar(u8, cursor_value, ':');
+                const shape = cursor_iter.next().?;
 
-                // Parse shape (if present)
-                if (cursor_iter.next()) |shape| {
-                    // For convenience, "blink" or "steady" alone implies bar (default)
-                    if (std.mem.eql(u8, shape, "blink")) {
-                        result.cursor.shape = .bar;
-                        result.cursor.style = .blink;
-                    } else if (std.mem.eql(u8, shape, "steady")) {
-                        result.cursor.shape = .bar;
-                        result.cursor.style = .steady;
-                    } else {
-                        result.cursor.shape = std.meta.stringToEnum(Cursor.Shape, shape) orelse return error.InvalidValue;
-                    }
-
-                    // Parse style (if present)
-                    if (cursor_iter.next()) |style| {
-                        result.cursor.style = std.meta.stringToEnum(Cursor.Style, style) orelse return error.InvalidValue;
-                    }
+                // For convenience, "blink" or "steady" alone implies bar (default)
+                if (std.mem.eql(u8, shape, "blink")) {
+                    result.cursor.shape = .bar;
+                    result.cursor.style = .blink;
+                } else if (std.mem.eql(u8, shape, "steady")) {
+                    result.cursor.shape = .bar;
+                    result.cursor.style = .steady;
                 } else {
-                    result.cursor = .{};
+                    result.cursor.shape = std.meta.stringToEnum(Cursor.Shape, shape) orelse return error.InvalidValue;
+                }
+
+                // Parse style (if present)
+                if (cursor_iter.next()) |style| {
+                    result.cursor.style = std.meta.stringToEnum(Cursor.Style, style) orelse return error.InvalidValue;
                 }
                 if (cursor_iter.next() != null) return error.InvalidValue;
                 continue;
@@ -94,19 +90,14 @@ pub const ShellIntegrationFeatures = struct {
                 continue;
             }
 
-            const name, const value = part: {
-                const negation_prefix = "no-";
-                const trimmed_name = std.mem.trim(u8, part_raw, cli.args.whitespace);
-                if (std.mem.startsWith(u8, trimmed, negation_prefix)) {
-                    break :part .{ trimmed_name[negation_prefix.len..], false };
-                } else {
-                    break :part .{ trimmed_name, true };
-                }
-            };
+            const name, const value = if (std.mem.cutPrefix(u8, trimmed, "no-")) |name|
+                .{ name, false }
+            else
+                .{ trimmed, true };
 
-            inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
-                if (field.type == bool and std.mem.eql(u8, field.name, name)) {
-                    @field(result, field.name) = value;
+            inline for (@typeInfo(ShellIntegrationFeatures).@"struct".field_names, @typeInfo(ShellIntegrationFeatures).@"struct".field_types) |field, field_type| {
+                if (field_type == bool and std.mem.eql(u8, field, name)) {
+                    @field(result, field) = value;
                     continue :loop;
                 }
             }
@@ -125,33 +116,21 @@ pub const ShellIntegrationFeatures = struct {
         env,
     };
 
-    pub fn format(self: ShellIntegrationFeatures, writer: *std.Io.Writer, mode: FormatMode) anyerror!void {
-        const fields = comptime fields: {
-            const all_fields = @typeInfo(ShellIntegrationFeatures).@"struct".fields;
-            var sorted: [all_fields.len]std.builtin.Type.StructField = all_fields[0..].*;
-            const SortContext = struct {
-                fn lessThan(_: @This(), a: std.builtin.Type.StructField, b: std.builtin.Type.StructField) bool {
-                    return std.ascii.orderIgnoreCase(a.name, b.name) == .lt;
-                }
-            };
-            std.mem.sortUnstable(std.builtin.Type.StructField, &sorted, SortContext{}, SortContext.lessThan);
-            break :fields sorted;
-        };
-
-        inline for (fields) |field| {
-            const enabled = switch (field.type) {
-                bool => @field(self, field.name),
-                Cursor => @field(self, field.name).shape != .disabled,
+    pub fn format(self: ShellIntegrationFeatures, writer: *std.Io.Writer, mode: FormatMode) std.Io.Writer.Error!void {
+        inline for (@typeInfo(ShellIntegrationFeatures).@"struct".field_names, @typeInfo(ShellIntegrationFeatures).@"struct".field_types) |field, field_type| {
+            const enabled = switch (field_type) {
+                bool => @field(self, field),
+                Cursor => @field(self, field).shape != .disabled,
                 else => @compileError("unexpected field type in ShellIntegrationFeatures"),
             };
             if (enabled or mode == .config) {
-                if (writer.end > 0) try writer.writeByte(',');
+                if (writer.buffered().len > 0) try writer.writeByte(',');
                 if (mode == .config and !enabled) try writer.writeAll("no-");
-                try writer.writeAll(field.name);
+                try writer.writeAll(field);
 
-                if (enabled) switch (field.type) {
+                if (enabled) switch (field_type) {
                     Cursor => {
-                        const cursor = @field(self, field.name);
+                        const cursor = @field(self, field);
                         switch (mode) {
                             // DECSCUSR codes
                             .env => {
@@ -196,7 +175,7 @@ pub const ShellIntegrationFeatures = struct {
         var buf: [128]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
         try self.format(&writer, .config);
-        try formatter.formatEntry([]const u8, buf[0..writer.end]);
+        try formatter.formatEntry([]const u8, writer.buffered());
     }
 
     pub fn clone(self: ShellIntegrationFeatures, _: Allocator) error{}!ShellIntegrationFeatures {
@@ -211,30 +190,30 @@ pub const ShellIntegrationFeatures = struct {
         const testing = std.testing;
 
         // Test that we can parse each bool field by name.
-        inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
-            if (comptime field.type == bool) {
-                const result = try ShellIntegrationFeatures.parseCLI(field.name);
-                try testing.expect(@field(result, field.name));
+        inline for (@typeInfo(ShellIntegrationFeatures).@"struct".field_names, @typeInfo(ShellIntegrationFeatures).@"struct".field_types) |field, field_type| {
+            if (comptime field_type == bool) {
+                const result = try ShellIntegrationFeatures.parseCLI(field);
+                try testing.expect(@field(result, field));
             }
         }
 
         // Test that we can parse each bool field with "no-" prefix.
-        inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
-            if (comptime field.type == bool) {
-                const result = try ShellIntegrationFeatures.parseCLI("no-" ++ field.name);
-                try testing.expect(!@field(result, field.name));
+        inline for (@typeInfo(ShellIntegrationFeatures).@"struct".field_names, @typeInfo(ShellIntegrationFeatures).@"struct".field_types) |field, field_type| {
+            if (comptime field_type == bool) {
+                const result = try ShellIntegrationFeatures.parseCLI("no-" ++ field);
+                try testing.expect(!@field(result, field));
             }
         }
 
         // Test true values enable all features
         inline for (.{ "1", "t", "T", "true" }) |input| {
             const result = try ShellIntegrationFeatures.parseCLI(input);
-            inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
-                switch (field.type) {
-                    bool => try testing.expect(@field(result, field.name)),
+            inline for (@typeInfo(ShellIntegrationFeatures).@"struct".field_names, @typeInfo(ShellIntegrationFeatures).@"struct".field_types) |field, field_type| {
+                switch (field_type) {
+                    bool => try testing.expect(@field(result, field)),
                     Cursor => {
-                        try testing.expectEqual(Cursor.Shape.bar, @field(result, field.name).shape);
-                        try testing.expectEqual(Cursor.Style.default, @field(result, field.name).style);
+                        try testing.expectEqual(Cursor.Shape.bar, @field(result, field).shape);
+                        try testing.expectEqual(Cursor.Style.default, @field(result, field).style);
                     },
                     else => {},
                 }
@@ -244,10 +223,10 @@ pub const ShellIntegrationFeatures = struct {
         // Test false values disable all features
         inline for (.{ "0", "f", "F", "false" }) |input| {
             const result = try ShellIntegrationFeatures.parseCLI(input);
-            inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
-                switch (field.type) {
-                    bool => try testing.expect(!@field(result, field.name)),
-                    Cursor => try testing.expectEqual(Cursor.Shape.disabled, @field(result, field.name).shape),
+            inline for (@typeInfo(ShellIntegrationFeatures).@"struct".field_names, @typeInfo(ShellIntegrationFeatures).@"struct".field_types) |field, field_type| {
+                switch (field_type) {
+                    bool => try testing.expect(!@field(result, field)),
+                    Cursor => try testing.expectEqual(Cursor.Shape.disabled, @field(result, field).shape),
                     else => {},
                 }
             }
@@ -255,15 +234,15 @@ pub const ShellIntegrationFeatures = struct {
 
         // Test all comma-separated field names.
         const all_input = comptime blk: {
-            const fields = @typeInfo(ShellIntegrationFeatures).@"struct".fields;
-            var buf: []const u8 = fields[0].name;
-            for (fields[1..]) |field| buf = buf ++ "," ++ field.name;
+            const fields = @typeInfo(ShellIntegrationFeatures).@"struct".field_names;
+            var buf: []const u8 = fields[0];
+            for (fields[1..]) |field| buf = buf ++ "," ++ field;
             break :blk buf;
         };
         const all_features = try ShellIntegrationFeatures.parseCLI(all_input);
-        inline for (@typeInfo(ShellIntegrationFeatures).@"struct".fields) |field| {
-            const value = @field(all_features, field.name);
-            switch (field.type) {
+        inline for (@typeInfo(ShellIntegrationFeatures).@"struct".field_names, @typeInfo(ShellIntegrationFeatures).@"struct".field_types) |field, field_type| {
+            const value = @field(all_features, field);
+            switch (field_type) {
                 bool => try testing.expect(value),
                 Cursor => {
                     try testing.expectEqual(Cursor.Shape.bar, value.shape);
@@ -274,13 +253,13 @@ pub const ShellIntegrationFeatures = struct {
         }
 
         // Cursor shapes and styles
-        inline for (@typeInfo(Cursor.Shape).@"enum".fields) |shape_field| {
-            const shape = @field(Cursor.Shape, shape_field.name);
+        inline for (@typeInfo(Cursor.Shape).@"enum".field_names) |shape_field| {
+            const shape = @field(Cursor.Shape, shape_field);
             if (comptime shape != .disabled) {
-                inline for (@typeInfo(Cursor.Style).@"enum".fields) |style_field| {
-                    const style = @field(Cursor.Style, style_field.name);
-                    const style_name = if (comptime style == .default) "" else ":" ++ style_field.name;
-                    const input = "cursor:" ++ shape_field.name ++ style_name;
+                inline for (@typeInfo(Cursor.Style).@"enum".field_names) |style_field| {
+                    const style = @field(Cursor.Style, style_field);
+                    const style_name = if (comptime style == .default) "" else ":" ++ style_field;
+                    const input = "cursor:" ++ shape_field ++ style_name;
                     const result = try ShellIntegrationFeatures.parseCLI(input);
                     try testing.expectEqual(shape, result.cursor.shape);
                     try testing.expectEqual(style, result.cursor.style);
@@ -310,7 +289,7 @@ pub const ShellIntegrationFeatures = struct {
                 var buf: [128]u8 = undefined;
                 var writer: std.Io.Writer = .fixed(&buf);
                 try features.format(&writer, mode);
-                try testing.expectEqualStrings(expected, buf[0..writer.end]);
+                try testing.expectEqualStrings(expected, writer.buffered());
             }
         }.f;
 

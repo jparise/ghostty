@@ -8902,6 +8902,7 @@ pub const XtChecksumExtension = packed struct {
     undrawn: bool = false,
     full: bool = false,
 };
+
 pub const SplitPreserveZoom = packed struct {
     navigation: bool = false,
 };

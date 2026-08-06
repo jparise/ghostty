@@ -200,8 +200,9 @@ pub fn setupFeatures(
     }
     try resolved.format(&writer, .env);
 
-    if (writer.end > 0) {
-        try env.put("GHOSTTY_SHELL_FEATURES", buf[0..writer.end]);
+    const value = writer.buffered();
+    if (value.len > 0) {
+        try env.put("GHOSTTY_SHELL_FEATURES", value);
     }
 }
 
