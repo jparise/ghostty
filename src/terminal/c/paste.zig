@@ -117,12 +117,14 @@ fn readTrampoline(
 ) clipboard.MimeReader.Error!void {
     const req: *const Request = @ptrCast(@alignCast(ctx.?));
     var sink: Sink = .{ .writer = writer };
-    if (!req.reader.read.?(req.reader.userdata, .init(mime), .{
+    const ok = req.reader.read.?(req.reader.userdata, .init(mime), .{
         .write = &Sink.write,
         .userdata = &sink,
-    })) {
-        return if (sink.write_failed) error.WriteFailed else error.ReadFailed;
-    }
+    });
+    // A reader that ignores a refused write would otherwise paste what
+    // was written with the refused data missing.
+    if (sink.write_failed) return error.WriteFailed;
+    if (!ok) return error.ReadFailed;
 }
 
 pub fn is_safe(data: ?[*]const u8, len: usize) callconv(lib.calling_conv) bool {
