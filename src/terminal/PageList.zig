@@ -6885,6 +6885,51 @@ pub fn memoryStats(self: *const PageList) MemoryStats {
     return result;
 }
 
+/// The memory held by a page list. Returned by `memoryUsage`.
+pub const MemoryUsage = struct {
+    /// Number of pages in the list, including compressed pages.
+    pages: usize = 0,
+
+    /// Bytes of address space reserved for page memory. This counts every
+    /// page in the list at its full allocated size, whether it is resident
+    /// or compressed, plus the unused items held by the page pool. Unused
+    /// pool items have had their physical memory released, so they add to
+    /// this figure but never to `resident_bytes`.
+    virtual_bytes: usize = 0,
+
+    /// Bytes of physical memory used by pages. A resident page counts its
+    /// full allocated size. A compressed page counts its encoded data plus
+    /// any unused tail of its pool item, which compression doesn't release.
+    /// This is the same as `MemoryStats.estimatedResidentBytes`.
+    resident_bytes: usize = 0,
+
+    /// Number of pages stored compressed.
+    compressed_pages: usize = 0,
+
+    /// Total size of the encoded data of compressed pages. This is already
+    /// part of `resident_bytes`.
+    compressed_bytes: usize = 0,
+};
+
+/// Return the memory held by this page list, summarized for callers that
+/// budget memory across many terminals. See `memoryStats` for a more
+/// detailed breakdown.
+///
+/// This never restores a compressed page. It does visit every page, so its
+/// cost grows with the scrollback. Call it periodically rather than after
+/// every write.
+pub fn memoryUsage(self: *const PageList) MemoryUsage {
+    const stats = self.memoryStats();
+    return .{
+        .pages = stats.resident_pages + stats.compressed_pages,
+        .virtual_bytes = self.page_size +
+            self.pool.pages.freeCount() * PagePool.item_size,
+        .resident_bytes = stats.estimatedResidentBytes(),
+        .compressed_pages = stats.compressed_pages,
+        .compressed_bytes = stats.encoded_bytes,
+    };
+}
+
 /// Grow the number of rows available in the page list by n.
 /// This is only used for testing so it isn't optimized in any way.
 fn growRows(self: *PageList, n: usize) Allocator.Error!void {
@@ -8855,6 +8900,63 @@ test "PageList incremental compression keeps progress after tail growth" {
     const continued = s.compress(.incremental);
     try testing.expectEqual(IncrementalCompressionResult.pending, continued);
     try testing.expect(s.page_compression.flags.verifying);
+}
+
+test "PageList memory usage" {
+    const testing = std.testing;
+
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+
+    // A fresh list holds the preheated pool items, one of which backs
+    // the only page.
+    const fresh = s.memoryUsage();
+    try testing.expectEqual(s.totalPages(), fresh.pages);
+    try testing.expectEqual(page_preheat * PagePool.item_size, fresh.virtual_bytes);
+    try testing.expectEqual(s.page_size, fresh.resident_bytes);
+    try testing.expect(fresh.resident_bytes <= fresh.virtual_bytes);
+    try testing.expectEqual(@as(usize, 0), fresh.compressed_pages);
+    try testing.expectEqual(@as(usize, 0), fresh.compressed_bytes);
+
+    try s.growColdPagesForTest(2);
+    const before = s.memoryUsage();
+    try testing.expectEqual(s.totalPages(), before.pages);
+    try testing.expectEqual(
+        s.page_size + s.pool.pages.freeCount() * PagePool.item_size,
+        before.virtual_bytes,
+    );
+    try testing.expect(before.resident_bytes <= before.virtual_bytes);
+
+    // Compression changes residency but not address space.
+    _ = s.compress(.full);
+    const compressed = s.memoryUsage();
+    try testing.expectEqual(before.pages, compressed.pages);
+    try testing.expectEqual(before.virtual_bytes, compressed.virtual_bytes);
+    try testing.expect(compressed.resident_bytes < before.resident_bytes);
+    try testing.expectEqual(@as(usize, 2), compressed.compressed_pages);
+    try testing.expect(compressed.compressed_bytes > 0);
+    try testing.expectEqual(
+        s.memoryStats().estimatedResidentBytes(),
+        compressed.resident_bytes,
+    );
+
+    // The query itself never restores a page.
+    try testing.expectEqual(compressed, s.memoryUsage());
+
+    // Reading a page restores it.
+    _ = s.pages.first.?.page();
+    const restored = s.memoryUsage();
+    try testing.expectEqual(@as(usize, 1), restored.compressed_pages);
+    try testing.expect(restored.resident_bytes > compressed.resident_bytes);
+    try testing.expectEqual(before.virtual_bytes, restored.virtual_bytes);
+
+    // Destroyed pages go back to the pool: the address space is kept but
+    // the memory is no longer resident.
+    s.eraseRows(.{ .history = .{} }, null);
+    const erased = s.memoryUsage();
+    try testing.expect(erased.pages < restored.pages);
+    try testing.expectEqual(before.virtual_bytes, erased.virtual_bytes);
+    try testing.expect(erased.resident_bytes < restored.resident_bytes);
 }
 
 test "PageList memory stats do not restore compressed pages" {
