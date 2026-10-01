@@ -1093,8 +1093,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let config = ghostty.config
 
         // Setting all three of these is required for restoration to work.
-        window.isRestorable = restorable
-        if restorable {
+        window.isRestorable = restorable && config.windowSaveState != "never"
+        if window.isRestorable {
             window.restorationClass = TerminalWindowRestoration.self
             window.identifier = .init(String(describing: TerminalWindowRestoration.self))
         }
