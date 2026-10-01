@@ -6608,6 +6608,7 @@ test "get mouse_shape" {
         .{ "\x1b]22;not-a-pointer-shape\x07", mouse.Shape.crosshair },
         // Hyperlinks don't override the application's requested shape.
         .{ "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\", mouse.Shape.crosshair },
+        .{ "\x1b]22;\x1b\\", mouse.Shape.text },
         .{ "\x1b]22;default\x07", mouse.Shape.default },
         .{ "\x1b]22;text\x07", mouse.Shape.text },
     };
