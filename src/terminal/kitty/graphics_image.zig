@@ -174,7 +174,7 @@ pub const LoadingImage = struct {
 
         // Otherwise, the payload data is guaranteed to be a path.
 
-        if (comptime builtin.os.tag != .windows) {
+        if (comptime builtin.target.os.tag != .windows) {
             if (std.mem.indexOfScalar(u8, cmd.data, 0) != null) {
                 // POSIX paths cannot contain internal nulls.
                 log.warn("invalid image path: BadPathName", .{});
@@ -203,7 +203,7 @@ pub const LoadingImage = struct {
     ) !void {
         // android does not support POSIX shared memory.
         // windows is currently unsupported, does it support shm?
-        if (comptime builtin.abi.isAndroid() or builtin.target.os.tag == .windows) {
+        if (comptime builtin.target.abi.isAndroid() or builtin.target.os.tag == .windows) {
             return error.UnsupportedMedium;
         }
 
@@ -356,7 +356,7 @@ pub const LoadingImage = struct {
         // is checked before the open. The canonical path of the opened
         // file is checked again in validatedFilePath. See kitty_windows
         // for what is refused and why.
-        if (comptime builtin.os.tag == .windows) {
+        if (comptime builtin.target.os.tag == .windows) {
             kitty_windows.checkPath(path) catch |err| {
                 log.warn("invalid image path: {}", .{err});
                 return error.InvalidData;
@@ -479,7 +479,7 @@ pub const LoadingImage = struct {
     fn validatedFilePath(io: std.Io, file: std.Io.File, buf: []u8) ![]const u8 {
         const path = buf[0..try file.realPath(io, buf)];
 
-        if (comptime builtin.os.tag == .windows) {
+        if (comptime builtin.target.os.tag == .windows) {
             try kitty_windows.checkCanonicalPath(path);
             return path;
         }
@@ -512,7 +512,7 @@ pub const LoadingImage = struct {
         // On macOS /tmp is a symlink to /private/tmp, and the path is
         // canonical (see validatedFilePath), so files in /tmp only
         // match the canonical directory.
-        if (comptime builtin.os.tag.isDarwin()) {
+        if (comptime builtin.target.os.tag.isDarwin()) {
             if (isPathInDir("/private/tmp", path)) return true;
         }
 
@@ -952,7 +952,7 @@ test "shared memory names" {
 }
 
 test "image load rejects shared memory names containing NUL" {
-    if (comptime builtin.abi.isAndroid() or
+    if (comptime builtin.target.abi.isAndroid() or
         builtin.target.os.tag == .windows or
         !builtin.link_libc)
     {
@@ -985,7 +985,7 @@ test "image load rejects shared memory names containing NUL" {
 }
 
 test "image load accepts shared memory names without a leading slash" {
-    if (comptime builtin.abi.isAndroid() or
+    if (comptime builtin.target.abi.isAndroid() or
         builtin.target.os.tag == .windows or
         !builtin.link_libc)
     {
@@ -1415,7 +1415,7 @@ test "image load: temporary file outside directory prefix is rejected" {
 test "image load: temporary file in /tmp on macOS" {
     // /tmp is a symlink to /private/tmp on macOS, so the canonical path
     // of a file in it does not start with /tmp.
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1685,7 +1685,7 @@ test "image load: rgb, not compressed, relative regular file" {
 }
 
 test "image load: blocklist applies to opened file after symlink swap" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const io = testing.io;
@@ -1718,7 +1718,7 @@ test "image load: blocklist applies to opened file after symlink swap" {
 }
 
 test "image load: windows UNC path is rejected before open" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1757,7 +1757,7 @@ test "image load: windows UNC path is rejected before open" {
 }
 
 test "image load: windows device namespace paths are rejected before open" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1828,7 +1828,7 @@ test "image load: windows device namespace paths are rejected before open" {
 }
 
 test "image load: windows reserved device names are rejected before open" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1868,7 +1868,7 @@ test "image load: windows reserved device names are rejected before open" {
 }
 
 test "image load: windows local file accepted in forward slash and upper case spellings" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1921,7 +1921,7 @@ test "image load: windows local file accepted in forward slash and upper case sp
 }
 
 test "image load: windows temporary file with differently spelled directory" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1973,7 +1973,7 @@ test "image load: windows temporary file with differently spelled directory" {
 }
 
 test "image load: windows canonical path check accepts a local file opened through a device spelling" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2002,7 +2002,7 @@ test "image load: windows canonical path check accepts a local file opened throu
 }
 
 test "image load: windows canonical path check rejects a file reached through a UNC share" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
