@@ -867,7 +867,7 @@ pub const StreamHandler = struct {
                 // remainder for the row/column as base-10 numbers. This
                 // will support a very large terminal.
                 var msg: termio.Message = .{ .write_small = .{} };
-                const resp = try std.fmt.bufPrint(&msg.write_small.data, "\x1B[{};{}R", .{
+                const resp = try std.mem.print(&msg.write_small.data, "\x1B[{};{}R", .{
                     pos.y + 1,
                     pos.x + 1,
                 });
@@ -955,7 +955,7 @@ pub const StreamHandler = struct {
     pub fn queryKittyKeyboard(self: *StreamHandler) !void {
         log.debug("querying kitty keyboard mode", .{});
         var data: termio.Message.WriteReq.Small.Array = undefined;
-        const resp = try std.fmt.bufPrint(&data, "\x1b[?{}u", .{
+        const resp = try std.mem.print(&data, "\x1b[?{}u", .{
             self.terminal.screens.active.kitty_keyboard.current().int(),
         });
 
@@ -972,7 +972,7 @@ pub const StreamHandler = struct {
     ) !void {
         log.debug("reporting XTVERSION: ghostty {s}", .{build_config.version_string});
         var buf: [288]u8 = undefined;
-        const resp = try std.fmt.bufPrint(
+        const resp = try std.mem.print(
             &buf,
             "\x1BP>|{s} {s}\x1B\\",
             .{
