@@ -584,10 +584,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         guard isWindowLoaded, let window else { return }
         // Setting all three of these is required for restoration to work.
         window.isRestorable = restorable && config.windowSaveState != "never"
-        if window.isRestorable {
-            window.restorationClass = TerminalWindowRestoration.self
-            window.identifier = .init(String(describing: TerminalWindowRestoration.self))
-        }
+        window.restorationClass = TerminalWindowRestoration.self
+        window.identifier = .init(String(describing: TerminalWindowRestoration.self))
     }
 
     /// Update the accessory view of each tab according to the keyboard
