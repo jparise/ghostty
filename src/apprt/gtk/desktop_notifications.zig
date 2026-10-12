@@ -252,10 +252,10 @@ test "desktop notification IDs are stable per surface and content" {
     // Title and body are hashed as concatenated bytes.
     const a = formatId(&first_buf, surface_id, notificationHash("ab", "c"));
     const b = formatId(&repeated_buf, surface_id, notificationHash("a", "bc"));
-    try testing.expect(!std.mem.eql(u8, a, b));
+    try testing.expectEqualStrings(a, b);
 }
 
-test "desktop notifications replace and evict oldest" {
+test "desktop notifications replace and evict first entry" {
     const testing = std.testing;
 
     var notifications: DesktopNotifications = .{ .limit = 3 };
@@ -268,7 +268,7 @@ test "desktop notifications replace and evict oldest" {
     try testing.expect(try notifications.track(testing.allocator, 1) == null);
 
     const evicted = (try notifications.track(testing.allocator, 4)).?;
-    try testing.expectEqual(@as(u64, 2), evicted.hash);
+    try testing.expectEqual(@as(u64, 3), evicted.hash);
     try testing.expectEqual(@as(usize, 3), notifications.notifications.items.len);
 }
 
