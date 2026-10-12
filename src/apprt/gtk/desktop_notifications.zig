@@ -88,17 +88,22 @@ pub fn send(
         glib.Variant.newUint64(self.surface_id),
     );
 
-    const tracked = self.track(alloc, .{ .title = title, .body = body }) catch |err| {
+    const key: Key = .{ .title = title, .body = body };
+    const tracked: ?TrackResult = self.track(alloc, key) catch |err| blk: {
         log.warn("unable to track desktop notification err={}", .{err});
-        return;
+        break :blk null;
     };
-    if (tracked.evicted) |evicted| self.clearRemoved(alloc, evicted);
+    if (tracked) |result| {
+        if (result.evicted) |evicted| self.clearRemoved(alloc, evicted);
+    }
 
     var id_buf: [64]u8 = undefined;
-    const id = formatId(&id_buf, self.surface_id, tracked.key);
+    const id = formatId(&id_buf, self.surface_id, key);
     app.sendNotification(id, notification);
 
-    if (focused) self.scheduleTimeout(alloc, tracked.key);
+    if (focused) {
+        if (tracked) |result| self.scheduleTimeout(alloc, result.key);
+    }
 }
 
 /// Withdraw delivered notifications and cancel their timers. GIO's freedesktop
