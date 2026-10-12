@@ -25,7 +25,7 @@ const Timeout = struct {
     hash: u64,
 };
 
-/// Entries are ordered from oldest to newest; replacement refreshes their age.
+/// Tracked notification hashes. Replacements are appended as new entries.
 notifications: std.ArrayList(Notification) = .empty,
 /// Set when the core surface initializes and retained through cleanup.
 surface_id: u64 = 0,
@@ -123,10 +123,10 @@ fn find(self: *const DesktopNotifications, hash: u64) ?usize {
     return null;
 }
 
-/// Remove a matching entry without changing the age of the remaining entries.
+/// Remove a matching entry without preserving the order of the remaining items.
 fn remove(self: *DesktopNotifications, hash: u64) ?Notification {
     const i = self.find(hash) orelse return null;
-    return self.notifications.orderedRemove(i);
+    return self.notifications.swapRemove(i);
 }
 
 /// Cancel the removed entry's timer and withdraw it.
@@ -204,7 +204,8 @@ pub fn deinit(self: *DesktopNotifications, alloc: Allocator) void {
 
 fn notificationHash(title: []const u8, body: []const u8) u64 {
     var hasher = std.hash.Wyhash.init(0);
-    std.hash.autoHashStrat(&hasher, .{ .title = title, .body = body }, .Deep);
+    hasher.update(title);
+    hasher.update(body);
     return hasher.final();
 }
 
@@ -248,7 +249,7 @@ test "desktop notification IDs are stable per surface and content" {
     try testing.expect(!std.mem.eql(u8, first_id, other_title_id));
     try testing.expect(!std.mem.eql(u8, first_id, other_body_id));
 
-    // The string boundary is part of the hash, not just the concatenated text.
+    // Title and body are hashed as concatenated bytes.
     const a = formatId(&first_buf, surface_id, notificationHash("ab", "c"));
     const b = formatId(&repeated_buf, surface_id, notificationHash("a", "bc"));
     try testing.expect(!std.mem.eql(u8, a, b));
@@ -295,7 +296,7 @@ test "desktop notifications remove and drain independently" {
     try testing.expectEqual(@as(usize, 1), second.notifications.items.len);
 }
 
-test "desktop notifications removal preserves order" {
+test "desktop notification removal swaps in the last entry" {
     const testing = std.testing;
     var notifications: DesktopNotifications = .{ .limit = 3 };
     defer notifications.notifications.deinit(testing.allocator);
