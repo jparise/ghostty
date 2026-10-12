@@ -3816,6 +3816,9 @@ else
 /// with keybinds.
 @"gtk-tabs-location": GtkTabsLocation = .top,
 
+/// Sets the position of the close button in GTK tabs. Default `right`
+@"gtk-tabs-close-button-position": GtkTabsCloseButtonPosition = .right,
+
 /// If this is `true`, the titlebar will be hidden when the window is maximized,
 /// and shown when the titlebar is unmaximized. GTK only.
 ///
@@ -9328,6 +9331,12 @@ pub const GtkSingleInstance = enum {
 pub const GtkTabsLocation = enum {
     top,
     bottom,
+};
+
+/// See gtk-tabs-close-button-position
+pub const GtkTabsCloseButtonPosition = enum {
+    left,
+    right,
 };
 
 /// See gtk-toolbar-style

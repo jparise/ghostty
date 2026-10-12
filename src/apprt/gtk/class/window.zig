@@ -733,6 +733,11 @@ pub const Window = extern struct {
                 config.@"window-theme" == .ghostty,
         );
 
+        // Changes the position of the close button
+        priv.tab_bar.setInverted(@intFromBool(
+            config.@"gtk-tabs-close-button-position" == .left,
+        ));
+
         // Move the tab bar to the proper location.
         priv.toolbar.remove(priv.tab_bar.as(gtk.Widget));
         switch (config.@"gtk-tabs-location") {
