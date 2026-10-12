@@ -5032,6 +5032,9 @@ pub fn softReset(self: *Terminal) void {
     screen.cursor.style = .{};
     screen.manualStyleUpdate() catch unreachable;
     screen.cursor.protected = false;
+    // xterm also forgets which protection mode was used last, so erasing
+    // after a soft reset no longer skips ISO (SPA) protected cells.
+    screen.protected_mode = .off;
     screen.charset = .{};
 
     // A saved cursor now restores to the home position with the defaults.
@@ -16295,6 +16298,23 @@ test "Terminal: softReset pen, protection, and charsets" {
     try testing.expectEqual(@as(style.Id, 0), t.screens.active.cursor.style_id);
     try testing.expect(!t.screens.active.cursor.protected);
     try testing.expectEqual(charsets.Charset.utf8, t.screens.active.charset.charsets.get(.G0));
+}
+
+test "Terminal: softReset ends ISO protection for erase" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setProtectedMode(.iso);
+    try t.print('A');
+    t.setProtectedMode(.off);
+    t.softReset();
+    t.eraseDisplay(.complete, false);
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("", str);
+    }
 }
 
 test "Terminal: softReset status display and checksum" {
