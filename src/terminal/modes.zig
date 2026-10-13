@@ -104,7 +104,16 @@ pub const ModeState = struct {
         // DECRQM callers hear "unsupported" rather than "unknown".
         if (tag.ansi) {
             switch (tag.value) {
-                1, 5, 7, 10, 11, 13, 14, 15, 16, 17, 18, 19 => {
+                inline 1, 5, 7, 10, 11, 13, 14, 15, 16, 17, 18, 19 => |v| {
+                    comptime for (entries) |entry| {
+                        if (entry.ansi and entry.value == v) @compileError(
+                            std.fmt.comptimePrint(
+                                "ANSI mode {} is in the mode table and " ++
+                                    "must not be reported as permanently reset",
+                                .{v},
+                            ),
+                        );
+                    };
                     return .{ .tag = tag, .state = .permanently_reset };
                 },
                 else => {},
