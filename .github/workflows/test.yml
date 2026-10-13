@@ -2128,7 +2128,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pkg: ["wuffs"]
+        pkg: ["dcimgui", "wuffs"]
     name: Test pkg/${{ matrix.pkg }}
     runs-on: namespace-profile-ghostty-sm
     needs: test
