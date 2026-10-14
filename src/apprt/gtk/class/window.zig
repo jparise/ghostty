@@ -171,9 +171,13 @@ pub const Window = extern struct {
             pub const name = "tabs-inverted";
             const impl = gobject.ext.defineProperty(name, Self, bool, .{
                 .default = false,
-                .accessor = gobject.ext.typedAccessor(Self, bool, .{
-                    .getter = Self.getTabsInverted,
-                }),
+                .accessor = gobject.ext.typedAccessor(
+                    Self,
+                    bool,
+                    .{
+                        .getter = Self.getTabsInverted,
+                    },
+                ),
             });
         };
 
