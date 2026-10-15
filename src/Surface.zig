@@ -696,10 +696,14 @@ pub fn init(
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
         errdefer io_mailbox.deinit(alloc);
 
+        // Termio.init takes ownership of the config only on success.
+        var io_config = try termio.Termio.DerivedConfig.init(alloc, config);
+        errdefer io_config.deinit();
+
         try termio.Termio.init(&self.io, alloc, .{
             .size = size,
             .full_config = config,
-            .config = try termio.Termio.DerivedConfig.init(alloc, config),
+            .config = io_config,
             .backend = .{ .exec = io_exec },
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
