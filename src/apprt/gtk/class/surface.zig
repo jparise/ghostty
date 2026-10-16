@@ -3170,22 +3170,22 @@ pub const Surface = extern struct {
     fn updateImePosition(self: *Self) void {
         const priv = self.private();
         const surface = priv.core_surface orelse return;
-        const ime_point = surface.imePoint();
 
-        // imePoint divides by a scale that includes the font DPI scale
-        // (gtk-xft-dpi), but GTK wants widget coordinates, so undo that part.
-        const content_scale = self.getContentScale();
+        // GTK wants widget coordinates, so we divide by the surface scale
+        // only and leave out the font DPI scale (gtk-xft-dpi).
         const surface_scale: f32 = @floatCast(scale_util.widgetSurfaceScale(
             priv.render_surface.as(gtk.Widget),
         ));
-        const scale_x: f64 = content_scale.x / surface_scale;
-        const scale_y: f64 = content_scale.y / surface_scale;
+        const ime_point = surface.imePointScaled(.{
+            .x = surface_scale,
+            .y = surface_scale,
+        });
 
         // Snap outward to whole pixels; an empty rectangle means "unset".
-        const top = @floor((ime_point.y - ime_point.height) * scale_y);
-        const bottom = @ceil(ime_point.y * scale_y);
+        const top = @floor(ime_point.y - ime_point.height);
+        const bottom = @ceil(ime_point.y);
         priv.im_context.as(gtk.IMContext).setCursorLocation(&.{
-            .f_x = @intFromFloat(@floor(ime_point.x * scale_x)),
+            .f_x = @intFromFloat(@floor(ime_point.x)),
             .f_y = @intFromFloat(top),
             .f_width = 1,
             .f_height = @intFromFloat(@max(1, bottom - top)),
