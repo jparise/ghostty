@@ -239,6 +239,11 @@ pub const LoadingImage = struct {
             .flags = .{ .nonblocking = false },
         };
 
+        // We unlink whatever name the client sent, as the Kitty protocol
+        // requires. So a client can remove any shared memory object that
+        // Ghostty can open, including another app group's on macOS if it
+        // can guess the name. This applies to any name, not just ones
+        // without a leading slash.
         defer file.close(io);
         defer _ = std.c.shm_unlink(pathz);
 
@@ -901,6 +906,7 @@ pub const Rect = struct {
 /// for shm_open to judge since the valid forms are platform specific.
 fn validSharedMemoryName(name: []const u8, name_max: usize) bool {
     if (name.len == 0 or name.len > name_max) return false;
+    if (std.mem.eql(u8, name, "/")) return false;
     return std.mem.indexOfScalar(u8, name, 0) == null;
 }
 
@@ -939,6 +945,7 @@ test "shared memory names" {
     try testing.expect(validSharedMemoryName("/kitty/image", 16));
 
     try testing.expect(!validSharedMemoryName("", 8));
+    try testing.expect(!validSharedMemoryName("/", 8));
     try testing.expect(!validSharedMemoryName("/kitty\x00image", 16));
     try testing.expect(!validSharedMemoryName("kitty\x00image", 16));
     try testing.expect(!validSharedMemoryName("/12345678", 8));
