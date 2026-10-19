@@ -998,13 +998,13 @@ test "image load accepts shared memory names without a leading slash" {
     // Sandboxed macOS apps can only create names of this form. The pid
     // keeps concurrent test runs apart; Darwin limits names to 31 bytes.
     var buf: [32]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&buf, "{s}{d}", .{
+    const name = try std.fmt.bufPrintSentinel(&buf, "{s}{d}", .{
         if (comptime builtin.target.os.tag.isDarwin())
             "ghostty.test/shm-"
         else
             "ghostty-test-shm-",
         std.c.getpid(),
-    });
+    }, 0);
     const data = "\x01\x02\x03";
 
     const fd = std.c.shm_open(
@@ -1021,8 +1021,8 @@ test "image load accepts shared memory names without a leading slash" {
         },
     }
     defer _ = std.c.close(fd);
-    errdefer _ = std.c.shm_unlink(name);
-    try testing.expectEqual(@as(c_int, 0), std.c.ftruncate(fd, data.len));
+    defer _ = std.c.shm_unlink(name);
+    try testing.expectEqual(0, std.c.ftruncate(fd, data.len));
     {
         // macOS does not support write(2) on shared memory, so map it.
         const map = try std.posix.mmap(
@@ -1057,11 +1057,15 @@ test "image load accepts shared memory names without a leading slash" {
     defer loading.deinit(alloc);
     try testing.expectEqualSlices(u8, data, loading.data.items);
 
-    // The terminal must unlink the object after reading it.
-    try testing.expectEqual(
-        std.posix.E.NOENT,
-        std.posix.errno(std.c.shm_unlink(name)),
+    // The terminal must unlink the object after reading it. fstat can't
+    // tell us this since macOS always reports st_nlink 0 for shared memory.
+    const reopened = std.c.shm_open(
+        name,
+        @as(c_int, @bitCast(std.c.O{ .ACCMODE = .RDONLY })),
+        @as(std.c.mode_t, 0),
     );
+    if (reopened >= 0) _ = std.c.close(reopened);
+    try testing.expectEqual(std.posix.E.NOENT, std.posix.errno(reopened));
 }
 
 test "shared memory range with offset and size" {
