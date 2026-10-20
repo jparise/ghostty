@@ -635,16 +635,27 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *  cells in a single row. It is always one row tall. */
   GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_VIRTUAL = 0,
 
-  /** A relative placement attached to a virtual placement. Kitty
-   *  graphics lets a program position one image relative to another.
-   *  When the image it is attached to is a virtual placement, its
-   *  position also depends on the placeholder cells.
+  /** A placement that a program positioned relative to another
+   *  placement, its parent. Kitty graphics lets a program attach one
+   *  image to another so that they move together. The parent is either
+   *  a virtual or a fixed placement, possibly through a chain of other
+   *  relative placements.
    *
-   *  The position is measured from the top-left corner of the virtual
-   *  placement's cells on screen: the leftmost column and the topmost
-   *  row that any of its cells use. This matches Kitty. If none of those
-   *  cells are in the viewport, the relative placement is not included. */
+   *  With a virtual parent, the position depends on the placeholder
+   *  cells. It is measured from the top-left corner of the parent's
+   *  cells on screen: the leftmost column and the topmost row that any
+   *  of its cells use. This matches Kitty. If none of those cells are in
+   *  the viewport, the relative placement is not included. */
   GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_RELATIVE = 1,
+
+  /** A placement at a cell on the screen. It scrolls with the text,
+   *  like a line of output would. Its z-index is the one the program
+   *  chose, so it can be in any layer.
+   *
+   *  The render state does not report this kind yet. See "Which Images
+   *  Are Included" in the @ref render documentation. Handle it like any
+   *  other placement so that your renderer keeps working once it does. */
+  GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_FIXED = 2,
   GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateKittyPlacementKind;
 

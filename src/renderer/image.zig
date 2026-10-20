@@ -441,18 +441,19 @@ pub const State = struct {
             }.lessThan,
         );
 
-        // Find our indices. The values are sorted by z so we can
-        // find the first placement out of bounds to find the limits.
-        const bg_limit = std.math.minInt(i32) / 2;
+        // Find where each layer starts. The placements are sorted by z
+        // and the layer only grows with z, so the first placement in a
+        // layer marks the end of the layer before it.
         var bg_end: ?u32 = null;
         var text_end: ?u32 = null;
         for (self.kitty_placements.items, 0..) |p, i| {
-            if (bg_end == null and p.z >= bg_limit) bg_end = @intCast(i);
-            if (text_end == null and p.z >= 0) text_end = @intCast(i);
+            const layer = terminal.RenderState.imageLayerFromZ(p.z);
+            if (bg_end == null and layer != .below_background) bg_end = @intCast(i);
+            if (text_end == null and layer == .above_text) text_end = @intCast(i);
         }
 
-        // If we didn't see any images with a z > the bg limit,
-        // then our bg end is the end of our placement list.
+        // If no placement is above the background layer, then the
+        // background layer runs to the end of the list.
         self.kitty_bg_end =
             bg_end orelse @intCast(self.kitty_placements.items.len);
         // Same idea for the image_text_end.

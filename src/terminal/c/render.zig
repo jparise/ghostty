@@ -1239,7 +1239,7 @@ pub fn image_iterator_new(
     };
     ptr.* = .{
         .alloc = alloc,
-        .inner = .{ .rows = &.{}, .viewport_y_base = 0, .relative = &.{} },
+        .inner = .{ .rows = &.{}, .viewport_y_base = 0, .placed = &.{} },
         .current = null,
     };
     result.* = ptr;

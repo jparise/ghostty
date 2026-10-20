@@ -493,6 +493,35 @@ pub const RenderState = struct {
         "above_text",
     });
 
+    /// Returns the layer that an image with the given Kitty graphics
+    /// z-index is drawn in.
+    ///
+    /// Kitty graphics uses the z-index for two things: which layer an
+    /// image is drawn in, and the order of images within that layer. The
+    /// layer follows these ranges, which match Kitty:
+    ///
+    ///   - Below `minInt(i32) / 2` (-1,073,741,824): `below_background`.
+    ///   - From there up to -1: `below_text`.
+    ///   - Zero and above: `above_text`.
+    ///
+    /// Every `ImagePlacement` already has its `layer` set, so you only
+    /// need this when you get a z-index from somewhere else, such as the
+    /// terminal's Kitty image storage.
+    ///
+    /// Example:
+    ///
+    ///     imageLayerFromZ(-1); // .below_text
+    ///     imageLayerFromZ(0); // .above_text
+    ///     imageLayerFromZ(std.math.minInt(i32)); // .below_background
+    pub fn imageLayerFromZ(z: i32) ImageLayer {
+        return if (z < std.math.minInt(i32) / 2)
+            .below_background
+        else if (z < 0)
+            .below_text
+        else
+            .above_text;
+    }
+
     /// One rectangle of an image to draw. See `imagePlacementIterator`.
     ///
     /// To draw it, take the `source_*` rectangle of the image and draw
@@ -569,11 +598,28 @@ pub const RenderState = struct {
     /// The order is not the order to draw in. Sort by layer and then
     /// z-index before drawing. Only placements with something to draw
     /// are returned.
+    ///
+    /// The iterator returns the placeholder runs of each row first, then
+    /// the placements in `placed`. Build one with
+    /// `imagePlacementIterator` rather than setting the fields yourself.
     pub const ImagePlacementIterator = struct {
+        /// The placeholder runs of each captured row, top to bottom.
         rows: []const std.ArrayList(Placeholder),
+
+        /// The viewport y position of the first entry in `rows`. It is
+        /// negative when there are overscan rows above the viewport.
         viewport_y_base: isize,
-        relative: []const ImagePlacement,
+
+        /// Placements that already have their final position, returned
+        /// after all of the placeholder runs. These are the placements
+        /// that are not placeholder runs, such as relative placements.
+        placed: []const ImagePlacement,
+
+        /// The current index into `rows`.
         y: usize = 0,
+
+        /// The current index into the runs of `rows[y]`, or into
+        /// `placed` once every row is done.
         i: usize = 0,
 
         pub fn next(self: *ImagePlacementIterator) ?ImagePlacement {
@@ -612,9 +658,9 @@ pub const RenderState = struct {
             }
 
             const idx = self.i;
-            if (idx >= self.relative.len) return null;
+            if (idx >= self.placed.len) return null;
             self.i += 1;
-            return self.relative[idx];
+            return self.placed[idx];
         }
     };
 
@@ -634,7 +680,7 @@ pub const RenderState = struct {
         return .{
             .rows = self.row_data.items(.placeholders)[range.start..range.end],
             .viewport_y_base = self.viewportY(range.start),
-            .relative = self.kitty.relative.items,
+            .placed = self.kitty.placed.items,
         };
     }
 
@@ -1643,7 +1689,8 @@ const Kitty = struct {
 
         /// The placement ID, or zero if there isn't one. For a
         /// virtual run, this is the ID that the cells ask for. For a
-        /// relative placement, this is the ID the program gave it.
+        /// relative or fixed placement, this is the ID the program
+        /// gave it.
         placement_id: u32,
 
         pub const Kind = lib.Enum(lib.target, &.{
@@ -1652,12 +1699,24 @@ const Kitty = struct {
             // z-index is always -1.
             "virtual",
 
-            // A relative placement attached to a virtual placement.
-            // It is positioned from the top-left corner of the
-            // virtual placement's cells in the viewport: the leftmost
-            // column and topmost row that any of its cells use. This
-            // matches Kitty.
+            // A placement that a program positioned relative to
+            // another placement, its parent. The parent is either a
+            // virtual or a fixed placement, possibly through a chain of
+            // other relative placements.
+            //
+            // With a virtual parent, the position is measured from the
+            // top-left corner of the parent's placeholder cells in the
+            // viewport: the leftmost column and the topmost row that
+            // any of those cells use. This matches Kitty.
             "relative",
+
+            // A placement at a cell on the screen. It scrolls with the
+            // text, like a line of output would. Its z-index is the one
+            // the program chose, so it can be in any layer.
+            //
+            // The render state doesn't report this kind yet. It is
+            // here so that the value is reserved in the C API.
+            "fixed",
         });
     };
 
@@ -1747,8 +1806,11 @@ const Kitty = struct {
         /// the image storage generation changes.
         relative_roots: std.ArrayList(RelativeRoot) = .empty,
 
-        /// The relative placements positioned by the last update.
-        relative: std.ArrayList(RenderState.ImagePlacement) = .empty,
+        /// The placements positioned by the last update that aren't
+        /// placeholder runs. The image placement iterator returns these
+        /// after the runs. Currently this holds only relative
+        /// placements.
+        placed: std.ArrayList(RenderState.ImagePlacement) = .empty,
 
         const RelativeRoot = struct {
             /// The virtual placement at the start of the chain, and the
@@ -1763,7 +1825,7 @@ const Kitty = struct {
 
         fn deinit(self: *Data, alloc: Allocator) void {
             self.relative_roots.deinit(alloc);
-            self.relative.deinit(alloc);
+            self.placed.deinit(alloc);
         }
     };
 
@@ -1854,7 +1916,7 @@ const Kitty = struct {
         // drawn, which matches Kitty. There are rarely more than a few
         // relative placements, so a simple scan of the runs for each one
         // is fine.
-        state.kitty.relative.clearRetainingCapacity();
+        state.kitty.placed.clearRetainingCapacity();
         if (state.kitty.relative_roots.items.len == 0) return;
         const vp_start = state.viewportStart();
         const vp_placeholders = row_placeholders[vp_start..][0..state.rows];
@@ -1883,7 +1945,7 @@ const Kitty = struct {
             var positioned = p;
             positioned.x = std.math.cast(i32, x) orelse continue;
             positioned.y = std.math.cast(i32, y) orelse continue;
-            try state.kitty.relative.append(alloc, positioned);
+            try state.kitty.placed.append(alloc, positioned);
         }
     }
 
@@ -1938,14 +2000,7 @@ const Kitty = struct {
                     } },
                     .image_id = kv.key_ptr.image_id,
                     .image_generation = image.generation,
-                    // Kitty draws negative z-indexes below text. Below
-                    // minInt(i32) / 2 they are also below backgrounds.
-                    .layer = if (p.z < std.math.minInt(i32) / 2)
-                        .below_background
-                    else if (p.z < 0)
-                        .below_text
-                    else
-                        .above_text,
+                    .layer = RenderState.imageLayerFromZ(p.z),
                     .z = p.z,
                     .x = 0,
                     .y = 0,
