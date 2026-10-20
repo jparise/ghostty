@@ -395,7 +395,14 @@ pub const State = struct {
             var cell_it = render_state.imagePlacementIterator();
             while (cell_it.next()) |p| {
                 const image = switch (p.protocol) {
-                    .kitty => storage.imageById(p.image_id) orelse continue,
+                    .kitty => |k| image: {
+                        // The render state also reports fixed
+                        // placements, but this renderer still positions
+                        // them itself from the image storage above.
+                        // Skip them so they aren't drawn twice.
+                        if (k.kind == .fixed) continue;
+                        break :image storage.imageById(p.image_id) orelse continue;
+                    },
                 };
 
                 // For errors we log and continue. We try to place other

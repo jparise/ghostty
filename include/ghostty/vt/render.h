@@ -228,17 +228,58 @@ extern "C" {
  *
  * ### Which Images Are Included
  *
- * Currently the list holds the Kitty graphics images that a program shows
- * with placeholder cells (see below).
+ * The list currently holds these Kitty graphics images:
  *
- * Kitty images placed at a fixed position on the screen are not included
- * yet. Read those from the Kitty graphics placement iterator, as
- * described in the @ref kitty_graphics documentation. To draw both kinds
- * together, get each fixed placement's position and size with
- * ghostty_kitty_graphics_placement_render_info(), and its z-index with
- * ghostty_kitty_graphics_placement_get(). The z-index also decides its
- * layer, as described in @ref GhosttyKittyPlacementLayer. Then sort all
- * of your images by layer and z-index as usual.
+ *   - Images shown with placeholder cells. See "Kitty Graphics
+ *     Placeholders" below.
+ *   - Images placed at a cell on the screen. These scroll with the text
+ *     around them, like a line of output. See "Kitty Graphics Fixed
+ *     Placements" below.
+ *   - Images placed relative to an image shown with placeholder cells.
+ *
+ * Images placed relative to an image at a cell on the screen are not in
+ * the list yet. Read those from the Kitty graphics placement iterator,
+ * as described in the @ref kitty_graphics documentation. Get each one's
+ * position and size with ghostty_kitty_graphics_placement_render_info(),
+ * and its z-index with ghostty_kitty_graphics_placement_get(). The
+ * z-index also decides its layer, as described in
+ * @ref GhosttyKittyPlacementLayer. Then sort all of your images by layer
+ * and z-index as usual.
+ *
+ * Earlier versions did not include images placed at a cell on the screen.
+ * If your renderer draws those from the Kitty graphics placement iterator,
+ * draw only the relative placements described above from it now.
+ * Otherwise those images are drawn twice.
+ *
+ * ### Images Partly Outside the Captured Rows
+ *
+ * An image is in the list when any part of it is in the captured rows
+ * (the viewport plus any overscan rows). Images shown with placeholder
+ * cells are split into one placement per row of cells, so each of those
+ * placements is always inside the captured rows.
+ *
+ * Every other placement is reported at its full size, even when only part
+ * of it can be seen. Its GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_COL can
+ * be negative, and its GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_ROW can be
+ * above the first overscan row. It can also extend past the right or
+ * bottom edge. Clip it to the area you draw. Most graphics APIs can do
+ * this for you with a scissor or clip rectangle.
+ *
+ * For example, with no overscan, an image 4 rows tall whose top row
+ * scrolled 2 rows above the viewport has a row of -2 and covers 4 rows.
+ * Draw it at its full size starting 2 rows above the viewport, clipped
+ * to the viewport. Its bottom 2 rows show at the top of the viewport.
+ *
+ * ### Kitty Graphics Fixed Placements
+ *
+ * A program can place a Kitty image at a cell on the screen. The image is
+ * attached to that cell, so it moves when the text moves: when new output
+ * scrolls the screen, when a program scrolls part of the screen, and when
+ * the viewport scrolls through the scrollback.
+ *
+ * The render state finds the position of these images during each update,
+ * so you don't need to track the cells yourself. This costs very little
+ * on a typical frame, including frames where the viewport scrolls.
  *
  * Later versions may add more protocols and more kinds of placements.
  * Skip any placement whose protocol you don't support, so that your
@@ -328,7 +369,8 @@ extern "C" {
  *   }
  *
  *   // The destination rectangle in pixels, relative to the top-left
- *   // corner of the viewport.
+ *   // corner of the viewport. It can start above or left of the
+ *   // viewport, so clip it when drawing.
  *   int32_t x = col * cell_width + (int32_t)offset_x;
  *   int32_t y = row * cell_height + (int32_t)offset_y;
  *
@@ -349,6 +391,9 @@ extern "C" {
  *     to it, for example right after the update while you hold your
  *     terminal lock. The image generation tells you when you need to
  *     read them again, so most frames don't touch the terminal at all.
+ *   - **Some images are only partly visible.** Clip what you draw to the
+ *     viewport, or to the captured rows if you draw overscan rows. See
+ *     "Images Partly Outside the Captured Rows" above.
  *   - **The terminal needs a cell size.** Image sizes depend on the size
  *     of a cell in pixels, which you set with ghostty_terminal_resize().
  *     Without it there is nothing to draw and the iterator is empty.
@@ -643,18 +688,22 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *
    *  With a virtual parent, the position depends on the placeholder
    *  cells. It is measured from the top-left corner of the parent's
-   *  cells on screen: the leftmost column and the topmost row that any
-   *  of its cells use. This matches Kitty. If none of those cells are in
-   *  the viewport, the relative placement is not included. */
+   *  cells on screen. That is the leftmost column and the topmost row
+   *  that any of its cells use, which matches Kitty. If none of those
+   *  cells are in the captured rows (the viewport plus any overscan), the
+   *  relative placement is not included.
+   *
+   *  Relative placements with a fixed parent are not included yet. See
+   *  "Which Images Are Included" in the @ref render documentation. */
   GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_RELATIVE = 1,
 
   /** A placement at a cell on the screen. It scrolls with the text,
    *  like a line of output would. Its z-index is the one the program
    *  chose, so it can be in any layer.
    *
-   *  The render state does not report this kind yet. See "Which Images
-   *  Are Included" in the @ref render documentation. Handle it like any
-   *  other placement so that your renderer keeps working once it does. */
+   *  It is included at its full size when any part of it is in the
+   *  captured rows, so it may need to be clipped when drawn. See "Images
+   *  Partly Outside the Captured Rows" in the @ref render documentation. */
   GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_FIXED = 2,
   GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateKittyPlacementKind;
@@ -704,13 +753,15 @@ typedef enum GHOSTTY_ENUM_TYPED {
 
   /** The column of the top-left cell (int32_t), where 0 is the leftmost
    *  column of the viewport. A placement can start to the left of the
-   *  viewport, which gives a negative value. */
+   *  viewport, which gives a negative value. See "Images Partly Outside
+   *  the Captured Rows" in the @ref render documentation. */
   GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_COL = 6,
 
   /** The row of the top-left cell (int32_t), where 0 is the top row of
    *  the viewport. A placement in an overscan row above the viewport has
    *  a negative row, the same as GHOSTTY_RENDER_STATE_ROW_DATA_VIEWPORT_Y.
-   *  A placement can also start above the viewport. */
+   *  A placement can also start above the first overscan row. See "Images Partly Outside the Captured Rows" in the
+   *  @ref render documentation. */
   GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_ROW = 7,
 
   /** The number of columns of cells the placement covers (uint32_t). */

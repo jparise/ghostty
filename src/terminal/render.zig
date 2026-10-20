@@ -135,10 +135,59 @@ const log = std.log.scoped(.render_state);
 ///         queue(texture, p);
 ///     }
 ///
-/// Currently the list holds the Kitty graphics images shown with
-/// placeholder cells (see below). Kitty images at a fixed position on
-/// screen are not included yet. Read those from the terminal's image
-/// storage.
+/// ### Which Images Are Included
+///
+/// The list currently holds these Kitty graphics images:
+///
+///   - Images shown with placeholder cells. See "Kitty Graphics
+///     Placeholders" below.
+///   - Images placed at a cell on the screen. These scroll with the
+///     text around them, like a line of output. See "Kitty Graphics
+///     Fixed Placements" below.
+///   - Images placed relative to an image shown with placeholder cells.
+///
+/// Images placed relative to an image at a cell on the screen are not in
+/// the list yet. Read only those from the terminal's Kitty image storage.
+/// Any other image you draw from the storage is drawn twice.
+///
+/// ### Images Partly Outside the Captured Rows
+///
+/// An image is in the list when any part of it is in the captured rows
+/// (the viewport plus any overscan rows). Images shown with placeholder
+/// cells are split into one placement per row of cells, so each of those
+/// placements is always inside the captured rows.
+///
+/// Every other placement is reported at its full size, even when only
+/// part of it can be seen. Its `x` can be negative, and its `y` can be
+/// above the first overscan row. It can also extend past the right or
+/// bottom edge. Clip it to the area you draw. Most graphics APIs can do
+/// this for you with a scissor or clip rectangle. For example, with no
+/// overscan:
+///
+///     // A fixed image 4 rows tall whose top row scrolled 2 rows above
+///     // the viewport has y = -2 and rows = 4. Its pixel position is
+///     // found the usual way, and `top` is negative.
+///     const left = p.x * cell_width + p.offset_x;
+///     const top = p.y * cell_height + p.offset_y;
+///
+///     // Clip to the viewport and draw the whole image. Rows -2 and -1
+///     // are cut off, and rows 0 and 1 show at the top of the viewport.
+///     setClip(0, 0, viewport_width, viewport_height);
+///     drawImage(texture, p, left, top, p.width, p.height);
+///
+/// ### Kitty Graphics Fixed Placements
+///
+/// A program can place a Kitty image at a cell on the screen. The image
+/// is attached to that cell, so it moves when the text moves: when new
+/// output scrolls the screen, when a program scrolls part of the screen,
+/// and when the viewport scrolls through the scrollback.
+///
+/// The render state finds the position of these images during each
+/// update. Most updates only need a few comparisons for this. When the
+/// images or the cell size change, the render state reads the image
+/// storage again. When only their positions can have changed, such as
+/// on a scroll, it moves the images it already knows about without
+/// reading the storage.
 ///
 /// ### Kitty Graphics Placeholders
 ///
@@ -557,8 +606,13 @@ pub const RenderState = struct {
 
         /// The top-left cell, where (0, 0) is the top-left cell of the
         /// viewport. `y` is negative for overscan rows above the
-        /// viewport, like `viewportY`. Some placements can also start
-        /// above or to the left of the viewport.
+        /// viewport, like `viewportY`.
+        ///
+        /// A placement that is only partly in the captured rows can start
+        /// left of the viewport or outside the captured rows, so `x` can
+        /// be negative and `y` can be above the first overscan row. See
+        /// "Images Partly Outside the Captured Rows" in the `RenderState`
+        /// docs.
         x: i32,
         y: i32,
 
@@ -667,10 +721,10 @@ pub const RenderState = struct {
     /// Returns an iterator over the image placements that the last update
     /// found. This covers every captured row, including overscan rows.
     ///
-    /// Currently these are the Kitty graphics placements shown through
-    /// placeholder cells (see "Kitty Graphics Placeholders" in the
-    /// `RenderState` docs). Images at a fixed position on screen are not
-    /// included yet. Read those from the terminal's image storage.
+    /// See "Which Images Are Included" in the `RenderState` docs for the
+    /// kinds of images in the list. Some placements are only partly in
+    /// the captured rows and must be clipped when drawn. See "Images
+    /// Partly Outside the Captured Rows" in the `RenderState` docs.
     ///
     /// This only reads memory owned by the render state, so it doesn't
     /// need access to the terminal. The next update invalidates the
@@ -1670,10 +1724,30 @@ pub const RenderState = struct {
     }
 };
 
-/// The Kitty graphics logic of the render state: finding the images that
-/// programs show with placeholder cells, and positioning the relative
-/// placements attached to them. See "Kitty Graphics Placeholders" in
-/// the `RenderState` docs.
+/// The Kitty graphics logic of the render state. See "Images" in the
+/// `RenderState` docs for what it produces.
+///
+/// There are two kinds of work:
+///
+///   - Placeholder runs. Each row keeps its own runs (`Row.placeholders`),
+///     and a run is looked up once, when its row is rebuilt.
+///   - Every other placement. These are kept in two lists. `roots` holds
+///     each placement with everything worked out except its position.
+///     `placed` holds the positioned copies that the iterator returns.
+///
+/// Building `roots` means walking every placement in the image storage,
+/// so it only happens when the storage or the cell size changes. Turning
+/// `roots` into `placed` is cheap, so it happens whenever a placement may
+/// have moved. For example, with one image at a fixed cell:
+///
+///   1. The program places the image. The storage generation changes, so
+///      the next update builds `roots` with one entry, then positions it
+///      into `placed`.
+///   2. The user scrolls the viewport up by one row. The update positions
+///      the same root again, and `placed` now has it one row lower. The
+///      storage is not read.
+///   3. The program prints text on an unrelated row. Fixed images don't
+///      move when cells change, so the update keeps `placed` as it is.
 const Kitty = struct {
     /// The Kitty image storage key of a placement, or void when Kitty
     /// graphics are disabled.
@@ -1706,16 +1780,21 @@ const Kitty = struct {
             //
             // With a virtual parent, the position is measured from the
             // top-left corner of the parent's placeholder cells in the
-            // viewport: the leftmost column and the topmost row that
-            // any of those cells use. This matches Kitty.
+            // captured rows. That is the leftmost column and the topmost
+            // row that any of those cells use, which matches Kitty. If
+            // none of the parent's cells are in the captured rows, the
+            // relative placement is not reported.
+            //
+            // Relative placements with a fixed parent are not reported
+            // yet.
             "relative",
 
             // A placement at a cell on the screen. It scrolls with the
             // text, like a line of output would. Its z-index is the one
             // the program chose, so it can be in any layer.
             //
-            // The render state doesn't report this kind yet. It is
-            // here so that the value is reserved in the C API.
+            // It is reported at full size when any part of it is in the
+            // captured rows, so it may need to be clipped when drawn.
             "fixed",
         });
     };
@@ -1787,51 +1866,130 @@ const Kitty = struct {
 
     /// The Kitty graphics state of a render state (`RenderState.kitty`).
     const Data = struct {
-        /// The image storage generation and the terminal size in pixels
-        /// when the runs were last looked up. If any of these change,
-        /// every run is looked up again. The pixel size stands in for
-        /// the cell size. (A change in rows or columns forces a redraw,
-        /// which looks up every run anyway.)
+        /// The image storage generation, the terminal size in pixels,
+        /// and the grid size when `roots` was last built. If any of
+        /// these change, `roots` is built again and every run is looked
+        /// up again. Together the pixel and grid sizes give the cell
+        /// size.
         generation: u64 = 0,
         width_px: u32 = 0,
         height_px: u32 = 0,
+        rows: size.CellCountInt = 0,
+        cols: size.CellCountInt = 0,
+
+        /// The image storage `dirty` counter when `placed` was last
+        /// built. The storage changes this counter whenever placements
+        /// may have moved, for example when a program scrolls part of
+        /// the screen. If it changed but the generation didn't, `placed`
+        /// is built again from the same `roots`.
+        dirty: u64 = 0,
 
         /// True if a row was rebuilt with placeholder runs since the
         /// last lookup, so some runs are `stale`. Set by the row
         /// builder so that updates without new runs can skip the lookup.
         stale: bool = false,
 
-        /// The relative placements attached to virtual placements, with
-        /// everything except their position worked out. Rebuilt when
-        /// the image storage generation changes.
-        relative_roots: std.ArrayList(RelativeRoot) = .empty,
+        /// The placements that aren't placeholder runs, with everything
+        /// except their position worked out. Built again only when
+        /// `generation`, the pixel size, or the grid size change. A
+        /// redraw alone, such as a viewport scroll, keeps it.
+        roots: std.ArrayList(Root) = .empty,
+
+        /// The number of `roots` positioned from placeholder cells (a
+        /// `virtual` anchor). These move when cells change, so an
+        /// update with rebuilt rows must position them again. When this
+        /// is zero, rebuilt rows can't move anything in `placed`.
+        virtual_anchors: u32 = 0,
+
+        /// The captured rows grouped by the page they are on, top to
+        /// bottom. This lets `rowIndexOfPin` find the row of a pin
+        /// without walking the page list. It is built from the captured
+        /// row pins each time `placed` is built, and only when some root
+        /// has a `pin` anchor.
+        chunks: std.ArrayList(Chunk) = .empty,
 
         /// The placements positioned by the last update that aren't
         /// placeholder runs. The image placement iterator returns these
-        /// after the runs. Currently this holds only relative
-        /// placements.
+        /// after the runs.
         placed: std.ArrayList(RenderState.ImagePlacement) = .empty,
 
-        const RelativeRoot = struct {
-            /// The virtual placement at the start of the chain, and the
-            /// total offset in cells from it to this placement.
-            root: PlacementKey,
-            horizontal_offset: i32,
-            vertical_offset: i32,
-
-            /// The placement, with `x` and `y` not yet set.
-            placement: RenderState.ImagePlacement,
-        };
-
         fn deinit(self: *Data, alloc: Allocator) void {
-            self.relative_roots.deinit(alloc);
+            self.roots.deinit(alloc);
+            self.chunks.deinit(alloc);
             self.placed.deinit(alloc);
         }
     };
 
+    /// A placement that isn't a placeholder run, with everything except
+    /// its position worked out. Its position is its anchor's position
+    /// plus the offsets. For example, a relative placement 2 columns
+    /// right of a virtual placement whose cells start at column 5 is
+    /// drawn at column 7.
+    const Root = struct {
+        /// What the placement is positioned from.
+        anchor: Anchor,
+
+        /// The offset in cells from the anchor to the placement. For a
+        /// relative placement, this adds up the offsets of every
+        /// placement in its chain of parents. Zero for fixed placements.
+        horizontal_offset: i32,
+        vertical_offset: i32,
+
+        /// The placement, with `x` and `y` not yet set.
+        placement: RenderState.ImagePlacement,
+    };
+
+    /// What a root is positioned from.
+    const Anchor = union(enum) {
+        /// The placeholder cells of a virtual placement. The position is
+        /// the smallest column and the smallest row of its runs in the
+        /// captured rows.
+        virtual: PlacementKey,
+
+        /// The cell of a fixed placement, as the pin that the image
+        /// storage keeps for it. The page list moves this pin as text
+        /// moves, so it is always current.
+        ///
+        /// The pointer is owned by the image storage. It is only read
+        /// during `beginUpdate`, and only while the storage generation
+        /// matches `Data.generation`. Removing a placement always changes
+        /// the generation, so the pointer is never read after the pin is
+        /// freed.
+        pin: *const PageList.Pin,
+    };
+
+    /// Neighboring captured rows that are on the same page. See
+    /// `Data.chunks`.
+    ///
+    /// For example, if the captured rows are rows 98 and 99 of page A
+    /// followed by rows 0 to 2 of page B, there are two chunks:
+    /// `{ A, start 98, index 0 }` and `{ B, start 0, index 2 }`.
+    const Chunk = struct {
+        /// The page and the row within it of the chunk's first row.
+        node: *PageList.List.Node,
+        start: size.CellCountInt,
+
+        /// The position of the chunk's first row among the captured
+        /// rows, where 0 is the first captured row. This is not a
+        /// `row_data` index. Add `rowDataRange().start` to get one.
+        index: isize,
+    };
+
     /// Work out what each placeholder run in the captured rows draws, and
-    /// position the relative placements attached to virtual placements.
-    /// This is part of `beginUpdate` and needs access to the terminal.
+    /// position every placement that isn't a placeholder run. This is
+    /// part of `beginUpdate` and needs access to the terminal. `redraw`
+    /// and `any_dirty` say whether every row or some rows were rebuilt.
+    ///
+    /// Most updates return after a few comparisons. The work is done by
+    /// `updateSlow` only when something may have changed:
+    ///
+    ///   - The storage or the cell size changed. Build `roots` again and
+    ///     look up every run.
+    ///   - Rebuilt rows have new runs. Look up only those runs.
+    ///   - Placements may have moved, because the viewport moved, the
+    ///     storage `dirty` counter changed, or rebuilt rows can move a
+    ///     placement positioned from placeholder cells. Build `placed`
+    ///     again from `roots`.
     fn update(
         state: *RenderState,
         alloc: Allocator,
@@ -1841,63 +1999,72 @@ const Kitty = struct {
     ) Allocator.Error!void {
         const storage = &t.screens.active.kitty_images;
 
-        // What a run draws depends only on the run itself, the image
-        // storage and the cell size. If the storage and cell size didn't
-        // change, only new runs (from rebuilt rows) need a lookup. After
-        // a redraw we look up every run, because the redraw may be a
-        // switch to the other screen, which has its own images.
+        // `roots` and what a run draws depend only on the image storage
+        // and the cell size. Switching to the other screen is caught
+        // too, because no two storages share a generation.
         //
-        // This runs on every update, so the common case (no placeholders
-        // and nothing changed) must stay a few comparisons.
-        const all = redraw or
-            state.kitty.generation != storage.generation or
+        // This runs on every update, so the common case (no images and
+        // nothing changed) must stay a few comparisons. A redraw alone,
+        // such as a viewport scroll, must not build `roots` again. A
+        // change in rows or columns always causes a redraw, so those are
+        // only compared on redraws.
+        const roots_stale = state.kitty.generation != storage.generation or
             state.kitty.width_px != t.width_px or
-            state.kitty.height_px != t.height_px;
-        if (!all and !state.kitty.stale) {
+            state.kitty.height_px != t.height_px or
+            (redraw and (state.kitty.rows != state.rows or
+                state.kitty.cols != state.cols));
+        if (!roots_stale and !state.kitty.stale) {
             @branchHint(.likely);
 
-            // No runs to look up. Relative placements only move when rows
-            // change, and there are none without roots.
-            if (!any_dirty or state.kitty.relative_roots.items.len == 0) return;
+            // No runs to look up. Placements only move when the viewport
+            // moves, when the storage says that they moved, or (for
+            // placements positioned from placeholder cells) when rows
+            // are rebuilt.
+            if (state.kitty.roots.items.len == 0) return;
+            if (!redraw and state.kitty.dirty == storage.dirty and
+                !(any_dirty and state.kitty.virtual_anchors > 0)) return;
         }
 
         try @call(
             .never_inline,
             updateSlow,
-            .{ state, alloc, t, all },
+            .{ state, alloc, t, roots_stale },
         );
     }
 
     /// The part of `update` that does the work. It is kept out of line
-    /// so that the common case in `update` stays small.
+    /// so that the common case in `update` stays small. `roots_stale` is
+    /// true when `roots` must be built again.
     fn updateSlow(
         state: *RenderState,
         alloc: Allocator,
         t: *const Terminal,
-        all: bool,
+        roots_stale: bool,
     ) Allocator.Error!void {
         const storage = &t.screens.active.kitty_images;
-        if (all) {
+        if (roots_stale) {
             state.kitty.generation = storage.generation;
             state.kitty.width_px = t.width_px;
             state.kitty.height_px = t.height_px;
-            try relativeRoots(state, alloc, t);
+            state.kitty.rows = state.rows;
+            state.kitty.cols = state.cols;
+            try rebuildRoots(state, alloc, t);
         }
 
-        const row_data = state.row_data.slice();
-        const row_placeholders = row_data.items(.placeholders);
-        if (all or state.kitty.stale) {
+        if (roots_stale or state.kitty.stale) {
             state.kitty.stale = false;
-            const cell_width: u32 = t.width_px / t.cols;
-            const cell_height: u32 = t.height_px / t.rows;
+            const cell_width: u32 = t.width_px / state.cols;
+            const cell_height: u32 = t.height_px / state.rows;
+            const row_data = state.row_data.slice();
             const row_pins = row_data.items(.pin);
+            const row_placeholders = row_data.items(.placeholders);
             const range = state.rowDataRange();
             for (
                 row_pins[range.start..range.end],
                 row_placeholders[range.start..range.end],
             ) |pin, runs| {
                 for (runs.items) |*run| {
-                    if (!all and run.state != .stale) continue;
+                    if (!roots_stale and run.state != .stale) continue;
                     resolvePlaceholder(
                         storage,
                         pin,
@@ -1909,114 +2076,291 @@ const Kitty = struct {
             }
         }
 
-        // Position each relative placement from the top-left corner of
-        // its virtual placement's cells in the viewport, using the
-        // smallest column and the smallest row of those cells. If the
-        // viewport has none of those cells, the relative placement isn't
-        // drawn, which matches Kitty. There are rarely more than a few
-        // relative placements, so a simple scan of the runs for each one
-        // is fine.
-        state.kitty.placed.clearRetainingCapacity();
-        if (state.kitty.relative_roots.items.len == 0) return;
-        const vp_start = state.viewportStart();
-        const vp_placeholders = row_placeholders[vp_start..][0..state.rows];
-        for (state.kitty.relative_roots.items) |root| {
-            var origin: ?struct { x: i64, y: i64 } = null;
-            for (vp_placeholders, 0..) |runs, y| {
-                for (runs.items) |run| {
-                    const target = run.target orelse continue;
-                    if (!target.eql(root.root)) continue;
-                    if (origin) |*o| {
-                        o.x = @min(o.x, run.x);
-                        o.y = @min(o.y, @as(i64, @intCast(y)));
-                    } else origin = .{ .x = run.x, .y = @intCast(y) };
-                }
-            }
-            const o = origin orelse continue;
+        try placeRoots(state, alloc);
+        state.kitty.dirty = storage.dirty;
+    }
 
-            // The position relative to the viewport, which can be
-            // negative. Skip placements entirely outside the viewport.
+    /// Build `state.kitty.placed` from `state.kitty.roots`: position each
+    /// root, and keep the ones with any part in the captured rows. This
+    /// never reads the image storage, so it is cheap enough to run on
+    /// every scroll.
+    fn placeRoots(
+        state: *RenderState,
+        alloc: Allocator,
+    ) Allocator.Error!void {
+        state.kitty.placed.clearRetainingCapacity();
+        if (state.kitty.roots.items.len == 0) return;
+
+        const range = state.rowDataRange();
+        const captured_len: isize = @intCast(range.end - range.start);
+        const captured_placeholders = state.row_data.items(.placeholders)[range.start..range.end];
+        const viewport_y_base = state.viewportY(range.start);
+
+        // Group the captured rows by page, for `rowIndexOfPin`. Only
+        // `pin` anchors need this.
+        state.kitty.chunks.clearRetainingCapacity();
+        if (state.kitty.virtual_anchors < state.kitty.roots.items.len) {
+            const captured_pins = state.row_data.items(.pin)[range.start..range.end];
+            try state.kitty.chunks.ensureTotalCapacity(alloc, captured_pins.len);
+            for (captured_pins, 0..) |pin, i| {
+                if (i > 0 and captured_pins[i - 1].node == pin.node) continue;
+                state.kitty.chunks.appendAssumeCapacity(.{
+                    .node = pin.node,
+                    .start = pin.y,
+                    .index = @intCast(i),
+                });
+            }
+        }
+
+        for (state.kitty.roots.items) |root| {
             const p = root.placement;
-            const x: i64 = o.x + root.horizontal_offset;
-            const y: i64 = o.y + root.vertical_offset;
-            if (y >= state.rows or y + p.rows - 1 < 0) continue;
-            if (x >= state.cols or x + p.cols - 1 < 0) continue;
+
+            // Where the anchor is. `y` counts captured rows, where 0 is
+            // the first captured row.
+            const origin: struct { x: i64, y: i64 } = switch (root.anchor) {
+                // The top-left corner of the virtual placement's cells:
+                // the smallest column and the smallest row of those
+                // cells. Without any of those cells in the captured rows,
+                // the placement isn't drawn, which matches Kitty. There
+                // are rarely more than a few of these, so a simple scan of
+                // the runs for each one is fine.
+                .virtual => |key| origin: {
+                    var origin: ?struct { x: i64, y: i64 } = null;
+                    for (captured_placeholders, 0..) |runs, y| {
+                        for (runs.items) |run| {
+                            const target = run.target orelse continue;
+                            if (!target.eql(key)) continue;
+                            if (origin) |*o| {
+                                o.x = @min(o.x, run.x);
+                                o.y = @min(o.y, @as(i64, @intCast(y)));
+                            } else origin = .{ .x = run.x, .y = @intCast(y) };
+                        }
+                    }
+                    const o = origin orelse continue;
+                    break :origin .{ .x = o.x, .y = o.y };
+                },
+
+                // The pin's cell. A pin is marked garbage when its row
+                // is removed from the scrollback. It has no position
+                // then, so the placement isn't drawn.
+                .pin => |pin| origin: {
+                    if (pin.garbage) continue;
+                    const y = rowIndexOfPin(
+                        state.kitty.chunks.items,
+                        pin.*,
+                        captured_len,
+                        p.rows,
+                        root.vertical_offset,
+                    ) orelse continue;
+                    break :origin .{ .x = pin.x, .y = y };
+                },
+            };
+
+            // The top-left cell, which can be above or left of the
+            // captured rows. Placements are reported at full size, so
+            // keep any with at least one cell in the captured rows.
+            const x: i64 = origin.x + root.horizontal_offset;
+            const y: i64 = origin.y + root.vertical_offset;
+            if (y + p.rows - 1 < 0 or y >= captured_len) continue;
+            if (x + p.cols - 1 < 0 or x >= state.cols) continue;
 
             var positioned = p;
             positioned.x = std.math.cast(i32, x) orelse continue;
-            positioned.y = std.math.cast(i32, y) orelse continue;
+            positioned.y = std.math.cast(i32, viewport_y_base + y) orelse continue;
             try state.kitty.placed.append(alloc, positioned);
         }
     }
 
-    /// Rebuild `state.kitty.relative_roots` from the image storage.
-    /// Everything about a relative placement except its position depends
-    /// only on the storage and the cell size, so this only runs when one
-    /// of those changes.
-    fn relativeRoots(
+    /// Returns the row of a pin, counted in captured rows where 0 is the
+    /// first captured row. The result is negative for rows above the
+    /// captured rows and `captured_len` or more for rows below them.
+    ///
+    /// `rows` and `vertical_offset` describe the placement that the pin
+    /// anchors: it starts `vertical_offset` rows below the pin and is
+    /// `rows` tall. If that placement can't reach the captured rows, the
+    /// search may stop early and return null.
+    ///
+    /// For example, with 5 captured rows and a placement 3 rows tall:
+    ///
+    ///   - A pin 2 rows above the first captured row returns -2. The
+    ///     placement covers rows -2 to 0, so its last row is visible.
+    ///   - A pin 10 rows above it may return null, because the placement
+    ///     ends at row -8.
+    ///
+    /// Pins on captured pages are found with the chunk table alone. Other
+    /// pins are found by walking the pages above or below. This is much
+    /// cheaper than `pointFromPin`, which counts rows from the top of the
+    /// scrollback. It reads page list nodes, so it is only safe while
+    /// the terminal can't change, such as during `beginUpdate`.
+    fn rowIndexOfPin(
+        chunks: []const Chunk,
+        pin: PageList.Pin,
+        captured_len: isize,
+        rows: u32,
+        vertical_offset: i32,
+    ) ?isize {
+        if (chunks.len == 0) return null;
+
+        // A pin on a page with captured rows. This also covers pins on
+        // rows of those pages that aren't captured.
+        for (chunks) |chunk| {
+            if (chunk.node != pin.node) continue;
+            return chunk.index + @as(isize, pin.y) - @as(isize, chunk.start);
+        }
+
+        // A pin on a page above the captured rows. The placement's last
+        // row is the pin's row plus `reach`, so it is only visible when
+        // the pin's row is -reach or more. Walk up a page at a time, and
+        // stop once a page's last row is too far up. `bottom` is the
+        // last row of the page being checked.
+        const reach: isize = @as(isize, rows) - 1 + @max(0, vertical_offset);
+        const first = chunks[0];
+        var bottom: isize = first.index - @as(isize, first.start) - 1;
+        var node = first.node.prev;
+        while (node) |n| : (node = n.prev) {
+            if (bottom < -reach) break;
+            const top = bottom - (@as(isize, n.rows()) - 1);
+            if (n == pin.node) return top + pin.y;
+            bottom = top - 1;
+        }
+
+        // A pin on a page below the captured rows. Only a negative
+        // offset can move such a placement up into them. Its first row
+        // is the pin's row plus the offset, which must be less than
+        // `captured_len`. Walk down a page at a time, and stop once a
+        // page's first row is too far down. `top` is the first row of
+        // the page being checked.
+        if (vertical_offset >= 0) return null;
+        const last = chunks[chunks.len - 1];
+        var top: isize = last.index - @as(isize, last.start) + last.node.rows();
+        node = last.node.next;
+        while (node) |n| : (node = n.next) {
+            if (top + vertical_offset >= captured_len) break;
+            if (n == pin.node) return top + pin.y;
+            top += n.rows();
+        }
+
+        return null;
+    }
+
+    /// Build `state.kitty.roots` again from the image storage. Everything
+    /// about a root except its position depends only on the storage and
+    /// the cell size, so this only runs when one of those changes. It
+    /// visits every placement in the storage.
+    fn rebuildRoots(
         state: *RenderState,
         alloc: Allocator,
         t: *const Terminal,
     ) Allocator.Error!void {
         const storage = &t.screens.active.kitty_images;
-        state.kitty.relative_roots.clearRetainingCapacity();
+        state.kitty.roots.clearRetainingCapacity();
+        state.kitty.virtual_anchors = 0;
         var it = storage.placements.iterator();
         while (it.next()) |kv| {
-            const rel = switch (kv.value_ptr.location) {
-                .relative => |rel| rel,
-                .pin, .virtual => continue,
+            // Keep placements with garbage pins. A pin can become
+            // garbage without a generation change, so `placeRoots`
+            // checks for it every time instead.
+            const root: Root = switch (kv.value_ptr.location) {
+                .pin => |pin| .{
+                    .anchor = .{ .pin = pin },
+                    .horizontal_offset = 0,
+                    .vertical_offset = 0,
+                    .placement = template(
+                        storage,
+                        t,
+                        kv.key_ptr.*,
+                        kv.value_ptr,
+                        .fixed,
+                    ) orelse continue,
+                },
+
+                .virtual => continue,
+
+                .relative => |rel| root: {
+                    // Follow the chain of parents to the placement at its
+                    // start. A broken chain is never drawn.
+                    const chain = storage.resolveChain(rel) orelse continue;
+                    switch (chain.root.location) {
+                        .virtual => {},
+
+                        // Chains that start at a fixed placement aren't
+                        // reported yet. The renderer still draws them from
+                        // the image storage. A later change gives them a
+                        // `pin` anchor here.
+                        .pin => continue,
+
+                        // resolveChain roots are never relative.
+                        .relative => unreachable,
+                    }
+
+                    break :root .{
+                        .anchor = .{ .virtual = chain.root_key },
+                        .horizontal_offset = chain.horizontal_offset,
+                        .vertical_offset = chain.vertical_offset,
+                        .placement = template(
+                            storage,
+                            t,
+                            kv.key_ptr.*,
+                            kv.value_ptr,
+                            .relative,
+                        ) orelse continue,
+                    };
+                },
             };
 
-            // Follow the chain of parents to the placement at its start.
-            // A broken chain is never drawn. Chains that start at a fixed
-            // position are drawn from the image storage instead.
-            const chain = storage.resolveChain(rel) orelse continue;
-            if (chain.root.location != .virtual) continue;
-
-            const image = storage.imageById(kv.key_ptr.image_id) orelse continue;
-            if (image.data.isPending()) continue;
-
-            // The size is zero when the terminal has no cell size in
-            // pixels. Then there is nothing to draw.
-            const p = kv.value_ptr;
-            const grid = p.gridSize(image, t);
-            if (grid.cols == 0 or grid.rows == 0) continue;
-            const dest = p.pixelSize(image, t);
-            if (dest.width == 0 or dest.height == 0) continue;
-            const offset = p.cellOffset(t);
-            const source = p.sourceRect(image);
-
-            try state.kitty.relative_roots.append(alloc, .{
-                .root = chain.root_key,
-                .horizontal_offset = chain.horizontal_offset,
-                .vertical_offset = chain.vertical_offset,
-                .placement = .{
-                    .protocol = .{ .kitty = .{
-                        .kind = .relative,
-                        .placement_id = switch (kv.key_ptr.placement_id.tag) {
-                            .external => kv.key_ptr.placement_id.id,
-                            .internal => 0,
-                        },
-                    } },
-                    .image_id = kv.key_ptr.image_id,
-                    .image_generation = image.generation,
-                    .layer = RenderState.imageLayerFromZ(p.z),
-                    .z = p.z,
-                    .x = 0,
-                    .y = 0,
-                    .cols = grid.cols,
-                    .rows = grid.rows,
-                    .offset_x = offset.x,
-                    .offset_y = offset.y,
-                    .width = dest.width,
-                    .height = dest.height,
-                    .source_x = source.x,
-                    .source_y = source.y,
-                    .source_width = source.width,
-                    .source_height = source.height,
-                },
-            });
+            try state.kitty.roots.append(alloc, root);
+            if (root.anchor == .virtual) state.kitty.virtual_anchors += 1;
         }
+    }
+
+    /// Returns the `ImagePlacement` for a placement in the image storage,
+    /// with everything except `x` and `y` filled in. Returns null if
+    /// there is nothing to draw, such as when the image is missing, still
+    /// loading, or the terminal has no cell size in pixels.
+    fn template(
+        storage: *const kitty_gfx.ImageStorage,
+        t: *const Terminal,
+        key: PlacementKey,
+        p: *const kitty_gfx.ImageStorage.Placement,
+        kind: Placement.Kind,
+    ) ?RenderState.ImagePlacement {
+        const image = storage.imageById(key.image_id) orelse return null;
+        if (image.data.isPending()) return null;
+
+        // The size is zero when the terminal has no cell size in pixels.
+        // Then there is nothing to draw.
+        const grid = p.gridSize(image, t);
+        if (grid.cols == 0 or grid.rows == 0) return null;
+        const dest = p.pixelSize(image, t);
+        if (dest.width == 0 or dest.height == 0) return null;
+        const offset = p.cellOffset(t);
+        const source = p.sourceRect(image);
+
+        return .{
+            .protocol = .{ .kitty = .{
+                .kind = kind,
+                .placement_id = switch (key.placement_id.tag) {
+                    .external => key.placement_id.id,
+                    .internal => 0,
+                },
+            } },
+            .image_id = key.image_id,
+            .image_generation = image.generation,
+            .layer = RenderState.imageLayerFromZ(p.z),
+            .z = p.z,
+            .x = 0,
+            .y = 0,
+            .cols = grid.cols,
+            .rows = grid.rows,
+            .offset_x = offset.x,
+            .offset_y = offset.y,
+            .width = dest.width,
+            .height = dest.height,
+            .source_x = source.x,
+            .source_y = source.y,
+            .source_width = source.width,
+            .source_height = source.height,
+        };
     }
 
     /// Look up what one placeholder run draws and store it in the run.
@@ -4354,5 +4698,560 @@ test "placeholders: relative placement rooted at a virtual placement" {
     t.eraseDisplay(.complete, false);
     try state.update(alloc, &t);
     it = state.imagePlacementIterator();
+    try testing.expect(it.next() == null);
+}
+
+/// Adds a complete 1 by 1 pixel Kitty image with the given ID to the
+/// active screen, for the `fixed:` tests.
+fn testFixedImage(t: *Terminal, image_id: u32) !void {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const pixels = try alloc.alloc(u8, 3);
+    @memset(pixels, 0);
+    try t.screens.active.kitty_images.addImage(io, alloc, t.screens.active, .{
+        .id = image_id,
+        .width = 1,
+        .height = 1,
+        .format = .rgb,
+        .data = .{ .complete = pixels },
+    });
+}
+
+/// Adds a fixed Kitty placement of image 1 at a cell of the active area,
+/// for the `fixed:` tests.
+fn testFixedPlacement(
+    t: *Terminal,
+    placement_id: u32,
+    x: size.CellCountInt,
+    y: size.CellCountInt,
+    columns: u32,
+    rows: u32,
+) !void {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const s = t.screens.active;
+    const pin = try s.pages.trackPin(
+        s.pages.pin(.{ .active = .{ .x = x, .y = y } }).?,
+    );
+    try s.kitty_images.addPlacement(io, alloc, s, 1, placement_id, .{
+        .location = .{ .pin = pin },
+        .columns = columns,
+        .rows = rows,
+    });
+}
+
+/// Returns the only image placement of a render state, failing the test
+/// if there isn't exactly one.
+fn testOnlyPlacement(state: *const RenderState) !RenderState.ImagePlacement {
+    var it = state.imagePlacementIterator();
+    const p = it.next() orelse return error.TestExpectedPlacement;
+    if (it.next() != null) return error.TestUnexpectedPlacement;
+    return p;
+}
+
+test "fixed: pin placement in viewport" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 100;
+
+    const storage = &t.screens.active.kitty_images;
+    try testFixedImage(&t, 1);
+    const pin = try t.screens.active.pages.trackPin(
+        t.screens.active.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
+    );
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 7, .{
+        .location = .{ .pin = pin },
+        .columns = 3,
+        .rows = 2,
+        .x_offset = 4,
+        .y_offset = 3,
+        .z = -5,
+    });
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const p = try testOnlyPlacement(&state);
+    const image = storage.imageById(1).?;
+    const sp = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 7 },
+    }).?;
+    const grid = sp.gridSize(image, &t);
+    const dest = sp.pixelSize(image, &t);
+    const offset = sp.cellOffset(&t);
+    const source = sp.sourceRect(image);
+    try testing.expectEqual(RenderState.KittyPlacement.Kind.fixed, p.protocol.kitty.kind);
+    try testing.expectEqual(7, p.protocol.kitty.placement_id);
+    try testing.expectEqual(1, p.image_id);
+    try testing.expectEqual(image.generation, p.image_generation);
+    try testing.expectEqual(2, p.x);
+    try testing.expectEqual(1, p.y);
+    try testing.expectEqual(3, p.cols);
+    try testing.expectEqual(2, p.rows);
+    try testing.expectEqual(grid.cols, p.cols);
+    try testing.expectEqual(grid.rows, p.rows);
+    try testing.expectEqual(4, p.offset_x);
+    try testing.expectEqual(3, p.offset_y);
+    try testing.expectEqual(offset.x, p.offset_x);
+    try testing.expectEqual(offset.y, p.offset_y);
+    try testing.expectEqual(dest.width, p.width);
+    try testing.expectEqual(dest.height, p.height);
+    try testing.expectEqual(source.x, p.source_x);
+    try testing.expectEqual(source.y, p.source_y);
+    try testing.expectEqual(source.width, p.source_width);
+    try testing.expectEqual(source.height, p.source_height);
+    try testing.expectEqual(-5, p.z);
+    try testing.expectEqual(RenderState.ImageLayer.below_text, p.layer);
+}
+
+test "fixed: scrolled partially above the viewport" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .rows = 5,
+        .cols = 10,
+        .max_scrollback_bytes = null,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 50;
+
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 1, 0, 2, 3);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    state.overscan_request = .{ .above = 1 };
+    try state.update(alloc, &t);
+    {
+        const p = try testOnlyPlacement(&state);
+        try testing.expectEqual(1, p.x);
+        try testing.expectEqual(0, p.y);
+    }
+
+    // Two lines of output move the placement two rows up. Its top row is
+    // now above the one overscan row, and it is still reported whole.
+    t.setCursorPos(5, 1);
+    try t.index();
+    try t.index();
+    try state.update(alloc, &t);
+    try testing.expectEqual(1, state.overscan.above);
+    {
+        const p = try testOnlyPlacement(&state);
+        try testing.expectEqual(1, p.x);
+        try testing.expectEqual(-2, p.y);
+        try testing.expectEqual(2, p.cols);
+        try testing.expectEqual(3, p.rows);
+        try testing.expectEqual(20, p.width);
+        try testing.expectEqual(30, p.height);
+    }
+
+    // Scrolling the viewport up a row moves it back down.
+    t.scrollViewport(.{ .delta = -1 });
+    try state.update(alloc, &t);
+    {
+        const p = try testOnlyPlacement(&state);
+        try testing.expectEqual(-1, p.y);
+        try testing.expectEqual(30, p.height);
+    }
+
+    // Three lines up, only the overscan row shows it.
+    t.scrollViewport(.bottom);
+    try t.index();
+    try state.update(alloc, &t);
+    try testing.expectEqual(-3, (try testOnlyPlacement(&state)).y);
+
+    // Four lines up, it doesn't reach the captured rows.
+    try t.index();
+    try state.update(alloc, &t);
+    var it = state.imagePlacementIterator();
+    try testing.expect(it.next() == null);
+}
+
+test "fixed: pin on a page above the captured rows" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .rows = 5,
+        .cols = 10,
+        .max_scrollback_bytes = null,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 50;
+    const pages = &t.screens.active.pages;
+    const first = pages.pages.first.?;
+    const page_rows: usize = first.capacity().rows;
+
+    // Scroll the first row far enough that the viewport is on the next
+    // page. The first row is then `distance` rows above the viewport.
+    try testFixedImage(&t, 1);
+    const distance = page_rows + 6;
+    t.setCursorPos(5, 1);
+    for (0..distance) |_| try t.index();
+    try testing.expect(pages.getTopLeft(.viewport).node == first.next.?);
+
+    // Placements on the first row: one tall enough to reach the second
+    // row of the viewport, and one that ends just above the viewport.
+    {
+        const s = t.screens.active;
+        const top: PageList.Pin = .{ .node = first, .y = 0, .x = 1 };
+        try s.kitty_images.addPlacement(io, alloc, s, 1, 1, .{
+            .location = .{ .pin = try pages.trackPin(top) },
+            .columns = 1,
+            .rows = @intCast(distance + 2),
+        });
+        try s.kitty_images.addPlacement(io, alloc, s, 1, 2, .{
+            .location = .{ .pin = try pages.trackPin(top) },
+            .columns = 1,
+            .rows = @intCast(distance),
+        });
+    }
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // The viewport is one chunk on the second page, so the first page is
+    // only found by the walk up.
+    try testing.expectEqual(1, state.kitty.chunks.items.len);
+    try testing.expect(state.kitty.chunks.items[0].node != first);
+
+    const p = try testOnlyPlacement(&state);
+    try testing.expectEqual(1, p.protocol.kitty.placement_id);
+    try testing.expectEqual(1, p.x);
+    try testing.expectEqual(-@as(i32, @intCast(distance)), p.y);
+    try testing.expectEqual(@as(u32, @intCast(distance + 2)), p.rows);
+}
+
+test "fixed: rowIndexOfPin walks pages above and below" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .rows = 5,
+        .cols = 10,
+        .max_scrollback_bytes = null,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 50;
+    const pages = &t.screens.active.pages;
+    const first = pages.pages.first.?;
+    const page_rows: isize = first.capacity().rows;
+
+    // Three pages, with the viewport on the middle one, three rows down.
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 0, 0, 1, 1);
+    t.setCursorPos(5, 1);
+    for (0..@intCast(2 * page_rows + 10)) |_| try t.index();
+    const middle = first.next.?;
+    const last = middle.next.?;
+    t.scrollViewport(.top);
+    t.scrollViewport(.{ .delta = @intCast(page_rows + 3) });
+    try testing.expect(pages.getTopLeft(.viewport).node == middle);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    const chunks = state.kitty.chunks.items;
+    try testing.expectEqual(1, chunks.len);
+    try testing.expectEqual(middle, chunks[0].node);
+    try testing.expectEqual(0, chunks[0].index);
+    try testing.expectEqual(3, chunks[0].start);
+    const captured: isize = 5;
+
+    // On a captured page, including its rows outside the captured rows.
+    try testing.expectEqual(0, Kitty.rowIndexOfPin(chunks, .{ .node = middle, .y = 3 }, captured, 1, 0));
+    try testing.expectEqual(-3, Kitty.rowIndexOfPin(chunks, .{ .node = middle, .y = 0 }, captured, 1, 0));
+    try testing.expectEqual(7, Kitty.rowIndexOfPin(chunks, .{ .node = middle, .y = 10 }, captured, 1, 0));
+
+    // Above: the last row of the first page is index -4. It is found when
+    // the placement can reach index 0, through its height or a positive
+    // offset, and not otherwise.
+    const above: PageList.Pin = .{ .node = first, .y = @intCast(page_rows - 1) };
+    try testing.expectEqual(-4, Kitty.rowIndexOfPin(chunks, above, captured, 5, 0));
+    try testing.expectEqual(-4, Kitty.rowIndexOfPin(chunks, above, captured, 1, 4));
+    try testing.expectEqual(null, Kitty.rowIndexOfPin(chunks, above, captured, 4, 0));
+    try testing.expectEqual(null, Kitty.rowIndexOfPin(chunks, above, captured, 4, -2));
+    const first_top: PageList.Pin = .{ .node = first, .y = 0 };
+    try testing.expectEqual(-3 - page_rows, Kitty.rowIndexOfPin(chunks, first_top, captured, @intCast(page_rows + 4), 0));
+
+    // Below: the first row of the last page comes right after the middle
+    // page's rows. Only a negative offset that moves it up into the
+    // captured rows finds it.
+    const below_index: isize = -3 + @as(isize, middle.rows());
+    const below: PageList.Pin = .{ .node = last, .y = 0 };
+    try testing.expectEqual(null, Kitty.rowIndexOfPin(chunks, below, captured, 100, 0));
+    try testing.expectEqual(below_index, Kitty.rowIndexOfPin(chunks, below, captured, 1, @intCast(captured - 1 - below_index)));
+    try testing.expectEqual(null, Kitty.rowIndexOfPin(chunks, below, captured, 1, @intCast(captured - below_index)));
+    const below2: PageList.Pin = .{ .node = last, .y = 2 };
+    try testing.expectEqual(below_index + 2, Kitty.rowIndexOfPin(chunks, below2, captured, 1, @intCast(-(below_index + 2))));
+}
+
+test "fixed: region scroll moves the placement without a generation change" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 6, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+    try t.switchScreenMode(.@"1049", true);
+
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 2, 3, 1, 1);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqual(3, (try testOnlyPlacement(&state)).y);
+
+    // Mark the template so we can tell whether the roots are rebuilt.
+    const poison = 12345;
+    state.kitty.roots.items[0].placement.width = poison;
+
+    // Scroll rows 2 to 5 (1-based) up by one with an index at the bottom
+    // margin.
+    const storage = &t.screens.active.kitty_images;
+    const generation = storage.generation;
+    t.setTopAndBottomMargin(2, 5);
+    t.setCursorPos(5, 1);
+    try t.index();
+    try testing.expectEqual(generation, storage.generation);
+    try state.update(alloc, &t);
+    {
+        const p = try testOnlyPlacement(&state);
+        try testing.expectEqual(2, p.x);
+        try testing.expectEqual(2, p.y);
+        try testing.expectEqual(poison, p.width);
+    }
+
+    // A storage change rebuilds the roots.
+    storage.markMutated(io);
+    try state.update(alloc, &t);
+    try testing.expectEqual(10, (try testOnlyPlacement(&state)).width);
+}
+
+test "fixed: viewport scroll does not rebuild roots" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .rows = 5,
+        .cols = 10,
+        .max_scrollback_bytes = null,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 50;
+
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 0, 2, 1, 2);
+    t.setCursorPos(5, 1);
+    for (0..3) |_| try t.index();
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqual(-1, (try testOnlyPlacement(&state)).y);
+    const poison = 12345;
+    state.kitty.roots.items[0].placement.width = poison;
+
+    t.scrollViewport(.{ .delta = -2 });
+    try state.update(alloc, &t);
+    const p = try testOnlyPlacement(&state);
+    try testing.expectEqual(1, p.y);
+    try testing.expectEqual(poison, p.width);
+}
+
+test "fixed: dirty row with only fixed placements skips the slow path" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 50;
+
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 0, 1, 1, 1);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    const poison = 12345;
+    state.kitty.placed.items[0].width = poison;
+
+    // Clear the dirty flags so we can see that the row was rebuilt.
+    @memset(state.row_data.items(.dirty), false);
+    t.screens.active.pages.pin(.{ .active = .{ .y = 3 } }).?.markDirty();
+    try state.update(alloc, &t);
+    try testing.expect(state.row_data.items(.dirty)[3]);
+    try testing.expectEqual(poison, (try testOnlyPlacement(&state)).width);
+}
+
+test "fixed: garbage pin is skipped" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .rows = 5,
+        .cols = 10,
+        .max_scrollback_bytes = null,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 50;
+
+    // A placement on the first page, scrolled onto the second page's
+    // history, and tall enough to reach the viewport.
+    const pages = &t.screens.active.pages;
+    const page_rows: usize = pages.pages.first.?.capacity().rows;
+    const distance = page_rows + 6;
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 0, 0, 1, @intCast(distance + 2));
+    t.setCursorPos(5, 1);
+    for (0..distance) |_| try t.index();
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqual(
+        -@as(i32, @intCast(distance)),
+        (try testOnlyPlacement(&state)).y,
+    );
+
+    // Lowering the scrollback limit prunes the first page. The pin moves
+    // to the top of the next page, where it would still reach the
+    // viewport, and becomes garbage. The storage keeps the placement and
+    // its generation until it reaps garbage.
+    const storage = &t.screens.active.kitty_images;
+    const generation = storage.generation;
+    t.setScrollbackMaxLines(1);
+    try testing.expectEqual(generation, storage.generation);
+    try testing.expectEqual(1, storage.placements.count());
+    var storage_it = storage.placements.valueIterator();
+    try testing.expect(storage_it.next().?.location.pin.garbage);
+    try state.update(alloc, &t);
+    var it = state.imagePlacementIterator();
+    try testing.expect(it.next() == null);
+}
+
+test "fixed: screen switch rebuilds roots" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 50;
+
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 3, 2, 1, 1);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqual(3, (try testOnlyPlacement(&state)).x);
+
+    try t.switchScreenMode(.@"1049", true);
+    try state.update(alloc, &t);
+    var it = state.imagePlacementIterator();
+    try testing.expect(it.next() == null);
+
+    try t.switchScreenMode(.@"1049", false);
+    try state.update(alloc, &t);
+    const p = try testOnlyPlacement(&state);
+    try testing.expectEqual(3, p.x);
+    try testing.expectEqual(2, p.y);
+}
+
+test "placeholders: relative rooted at a virtual placement in an overscan row" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .rows = 5,
+        .cols = 10,
+        .max_scrollback_bytes = null,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 50;
+    t.modes.set(.grapheme_cluster, true);
+
+    const storage = &t.screens.active.kitty_images;
+    try testFixedImage(&t, 1);
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .virtual = {} },
+        .columns = 1,
+        .rows = 1,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 2, .{
+        .location = .{ .relative = .{
+            .parent = .{
+                .image_id = 1,
+                .placement_id = .{ .tag = .external, .id = 1 },
+            },
+            .horizontal_offset = 1,
+            .vertical_offset = 2,
+        } },
+        .columns = 1,
+        .rows = 1,
+    });
+
+    // A placeholder cell at (3, 0), then one line of output to move it
+    // into the overscan row above the viewport.
+    try t.setAttribute(.{ .@"256_fg" = 1 });
+    try t.setAttribute(.{ .@"256_underline_color" = 1 });
+    t.screens.active.cursorAbsolute(3, 0);
+    try t.printString("\u{10EEEE}\u{0305}\u{0305}");
+    try t.setAttribute(.{ .unset = {} });
+    t.setCursorPos(5, 1);
+    try t.index();
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    state.overscan_request = .{ .above = 1 };
+    try state.update(alloc, &t);
+    try testing.expectEqual(1, state.overscan.above);
+
+    var it = state.imagePlacementIterator();
+    const parent = it.next().?;
+    try testing.expectEqual(RenderState.KittyPlacement.Kind.virtual, parent.protocol.kitty.kind);
+    try testing.expectEqual(-1, parent.y);
+    const child = it.next().?;
+    try testing.expectEqual(RenderState.KittyPlacement.Kind.relative, child.protocol.kitty.kind);
+    try testing.expectEqual(4, child.x);
+    try testing.expectEqual(1, child.y);
     try testing.expect(it.next() == null);
 }
