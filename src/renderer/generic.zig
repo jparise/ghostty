@@ -1499,9 +1499,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 //
                 // Images shown with placeholder cells move when those
                 // cells change, so if there are any, we also rebuild when
-                // the cells changed. The render state update above has
-                // already found the placeholder cells, looking only at the
-                // rows that changed, so this rebuild is cheap.
+                // the render state says its image list changed. The
+                // render state update above has already found the
+                // placeholder cells, looking only at the rows that
+                // changed, so this rebuild is cheap. Frames that only
+                // change text elsewhere skip it.
                 if (self.images.kittyRequiresUpdate(
                     state.terminal,
                     &self.terminal_state,

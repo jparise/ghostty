@@ -38,6 +38,12 @@ pub const State = struct {
     /// our placements are out of date and must be rebuilt.
     kitty_dirty: u64,
 
+    /// The render state's `imagesGeneration` at the time of our last
+    /// Kitty update. Images shown with placeholder cells come from the
+    /// render state, so when it returns a different value, our copies
+    /// of those placements are out of date and must be rebuilt.
+    kitty_images_generation: u64,
+
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
 
@@ -48,6 +54,7 @@ pub const State = struct {
         .kitty_text_end = 0,
         .kitty_virtual = false,
         .kitty_dirty = 0,
+        .kitty_images_generation = 0,
         .overlay_placements = .empty,
     };
 
@@ -247,11 +254,13 @@ pub const State = struct {
         // The images or their positions changed since our last update.
         if (t.screens.active.kitty_images.dirty != self.kitty_dirty) return true;
 
-        // Images shown with placeholder cells move when the cells change,
-        // so with any virtual placements we update whenever the render
-        // state changed. If the virtual placements are removed, the next
-        // update sets this back to false.
-        if (self.kitty_virtual and render_state.dirty != .false) return true;
+        // Images shown with placeholder cells move when the cells change.
+        // The render state tracks them, so with any virtual placements we
+        // update when its image list changed. Frames that only change
+        // text elsewhere don't. If the virtual placements are removed,
+        // the next update sets `kitty_virtual` back to false.
+        if (self.kitty_virtual and
+            render_state.imagesGeneration() != self.kitty_images_generation) return true;
 
         return false;
     }
@@ -272,6 +281,7 @@ pub const State = struct {
         // Remember the value we are building from so kittyRequiresUpdate
         // can tell when it changes again.
         self.kitty_dirty = storage.dirty;
+        self.kitty_images_generation = render_state.imagesGeneration();
 
         // We always clear our previous placements no matter what because
         // we rebuild them from scratch.
@@ -1354,6 +1364,63 @@ test "kitty renderer positions relative placements from virtual parent placehold
     try testing.expectEqual(@as(i32, 5), child.z);
     try testing.expectEqual(@as(i32, 2), child.x);
     try testing.expectEqual(@as(i32, 3), child.y);
+}
+
+test "kitty renderer skips updates for rows without placeholder cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    t.width_px = 50;
+    t.height_px = 50;
+    t.modes.set(.grapheme_cluster, true);
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+    var render_state: terminal.RenderState = .empty;
+    defer render_state.deinit(alloc);
+
+    const storage = &t.screens.active.kitty_images;
+    const pixels = try alloc.alloc(u8, 10 * 10 * 3);
+    @memset(pixels, 0);
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 10,
+        .format = .rgb,
+        .data = .{ .complete = pixels },
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .virtual = {} },
+    });
+    try t.setAttribute(.{ .@"256_fg" = 1 });
+    try t.setAttribute(.{ .@"256_underline_color" = 1 });
+    t.screens.active.cursorAbsolute(1, 1);
+    try t.printString("\u{10EEEE}\u{0305}\u{0305}");
+    try t.setAttribute(.{ .unset = {} });
+
+    try render_state.update(alloc, &t);
+    try testing.expect(state.kittyRequiresUpdate(&t, &render_state));
+    state.kittyUpdate(alloc, &t, &render_state);
+    try testing.expect(state.kitty_virtual);
+    try testing.expectEqual(@as(usize, 1), state.kitty_placements.items.len);
+
+    // A row without placeholder cells changes. The render state is
+    // dirty, but its placements are not.
+    t.screens.active.pages.pin(.{ .active = .{ .y = 3 } }).?.markDirty();
+    try render_state.update(alloc, &t);
+    try testing.expect(render_state.dirty != .false);
+    try testing.expect(!state.kittyRequiresUpdate(&t, &render_state));
+
+    // Overwriting the placeholder cells removes the image.
+    t.screens.active.cursorAbsolute(1, 1);
+    try t.printString("x");
+    try render_state.update(alloc, &t);
+    try testing.expect(state.kittyRequiresUpdate(&t, &render_state));
+    state.kittyUpdate(alloc, &t, &render_state);
+    try testing.expectEqual(@as(usize, 0), state.kitty_placements.items.len);
 }
 
 test "kitty renderer uploads the current animation frame" {
