@@ -1494,14 +1494,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :next now_ms + delay;
                 };
 
-                // If we have Kitty graphics data, we enter a SLOW SLOW SLOW path.
-                // We only do this if the Kitty image state is dirty meaning only if
-                // it changes.
+                // Rebuild our Kitty image placements when the Kitty image
+                // state changed.
                 //
-                // If we have any virtual references, we must also rebuild our
-                // kitty state on every frame because any cell change can move
-                // an image.
-                if (self.images.kittyRequiresUpdate(state.terminal)) {
+                // Images shown with placeholder cells move when those
+                // cells change, so if there are any, we also rebuild when
+                // the cells changed. The render state update above has
+                // already found the placeholder cells, looking only at the
+                // rows that changed, so this rebuild is cheap.
+                if (self.images.kittyRequiresUpdate(
+                    state.terminal,
+                    &self.terminal_state,
+                )) {
                     // We need to grab the draw mutex since this updates
                     // our image state that drawFrame uses.
                     self.draw_mutex.lockUncancelable(global.io());
@@ -1509,10 +1513,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.images.kittyUpdate(
                         self.alloc,
                         state.terminal,
-                        .{
-                            .width = self.grid_metrics.cell_width,
-                            .height = self.grid_metrics.cell_height,
-                        },
+                        &self.terminal_state,
                     );
                 }
 

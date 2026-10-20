@@ -151,6 +151,21 @@ extern "C" {
  *
  * @snippet c-vt-kitty-graphics/src/main.c kitty-graphics-animation-play
  *
+ * ## Unicode Placeholders
+ *
+ * A program can also place an image with text instead of at a fixed
+ * position. It creates a virtual placement and prints placeholder
+ * characters (U+10EEEE) where the image should appear, and the image
+ * moves with those characters.
+ *
+ * The placement iterator above still lists virtual placements (see
+ * @ref GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_VIRTUAL), but it can't
+ * tell you where to draw them, because that depends on the cells. To
+ * draw them, use the render state's image list. It finds the placeholder
+ * cells and gives you a position, size and source rectangle for each part
+ * of the image, with the protocol set to @ref GHOSTTY_IMAGE_PROTOCOL_KITTY.
+ * See "Images" in the @ref render documentation.
+ *
  * ## Lifetime and Thread Safety
  *
  * All handles borrowed from the terminal (GhosttyKittyGraphics,
@@ -237,6 +252,11 @@ typedef enum GHOSTTY_ENUM_TYPED {
 
   /**
    * Whether this is a virtual placement (unicode placeholder).
+   *
+   * A virtual placement is drawn wherever placeholder cells for it
+   * appear, so it has no position here. Use the render state's image
+   * list to draw it. See "Unicode Placeholders" in the
+   * @ref kitty_graphics documentation.
    *
    * Output type: bool *
    */
@@ -876,7 +896,9 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_placement_grid_size(
  * the placement is completely outside the viewport (its bottom edge
  * is above the viewport or its top edge is at or below the last
  * viewport row), or when the placement is a virtual (unicode
- * placeholder) placement.
+ * placeholder) placement. To draw virtual placements, and relative
+ * placements attached to them, see "Unicode Placeholders" in the
+ * @ref kitty_graphics documentation.
  *
  * @param iterator The placement iterator positioned on a placement
  * @param image The image handle for this placement's image
@@ -933,7 +955,9 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_placement_source_rect(
  *
  * When viewport_visible is false, the placement is fully off-screen
  * or is a virtual placement; viewport_col and viewport_row may
- * contain meaningless values in that case.
+ * contain meaningless values in that case. The render state gives the
+ * same information for virtual placements. See "Unicode Placeholders"
+ * in the @ref kitty_graphics documentation.
  *
  * @param iterator The iterator positioned on a placement
  * @param image The image handle for this placement's image
