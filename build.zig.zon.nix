@@ -56,7 +56,7 @@
     };
     "N-V-__8AAOgqbADacob-q2_DMQlmgaG4xKHRuW-6PJ4oJzMZ" = fetchzip {
       name = "fontconfig";
-      url = "https://gitlab.freedesktop.org/api/v4/projects/890/packages/generic/fontconfig/2.18.3/fontconfig-2.18.3.tar.xz";
+      url = "https://deps.files.ghostty.org/N-V-__8AAOgqbADacob-q2_DMQlmgaG4xKHRuW-6PJ4oJzMZ.tar.xz";
       hash = "sha256-fAe2C2MdhrVb12K8LBaUPU/OyWpulHpMsnarkuLHWS4=";
     };
     "N-V-__8AAKLKpwC4H27Ps_0iL3bPkQb-z6ZVSrB-x_3EEkub" = fetchzip {
@@ -76,7 +76,7 @@
     };
     "gobject-0.3.2-Skun7LuIogBbEh-6WrLeEzMaRCnOMB3eOf__RaPYSMCZ" = fetchzip {
       name = "gobject";
-      url = "https://github.com/ghostty-org/zig-gobject/releases/download/0.11.0-zig-0.17.0-2026-10-02-38-1/ghostty-gobject-0.11.0-zig-0.17.0-2026-10-02-38-1.tar.zst";
+      url = "https://deps.files.ghostty.org/gobject-2026-10-02-38-1.tar.zst";
       hash = "sha256-6ZoDkMCK8ytMLp+Ha9b2jJXwIXDxixuZwy+lEzdMwak=";
       nativeBuildInputs = [zstd];
     };
@@ -116,7 +116,7 @@
     };
     "libxev-0.0.0-86vtc8QQFACz0sVc7U-VDiDIgH-XfBuEY5JpABLjHNpn" = fetchzip {
       name = "libxev";
-      url = "https://github.com/mitchellh/libxev/archive/819ffa180ca20e31c7eded74e2e1aceb1eab557f.tar.gz";
+      url = "https://deps.files.ghostty.org/libxev-819ffa180ca20e31c7eded74e2e1aceb1eab557f.tar.gz";
       hash = "sha256-NQjVkejI44YRsXZoQeOfhb6Wb5+NMPXaA3VwmNaQM5c=";
     };
     "N-V-__8AAG3RoQEyRC2Vw7Qoro5SYBf62IHn3HjqtNVY6aWK" = fetchzip {
@@ -155,17 +155,17 @@
     };
     "translate_c-2.0.0-Q_BUWltOBwBYABF84EUL208pIFeUIwbBs29FmVBaafN5" = fetchzip {
       name = "translate_c";
-      url = "https://codeberg.org/ziglang/translate-c/archive/02ff0c523fb92a38939b04d0145c4a9602a74d56.tar.gz";
+      url = "https://deps.files.ghostty.org/translate_c-02ff0c523fb92a38939b04d0145c4a9602a74d56.tar.gz";
       hash = "sha256-13iPyWXUhBQXhF7AKbzKwrVdIrDQrMBNL8OfMyFdde0=";
     };
     "uucode-0.2.0-ZZjBPoGFVgCiflJNFc6Io8xzC67B6PA5bUkk4LT0kCxg" = fetchzip {
       name = "uucode";
-      url = "https://github.com/jacobsandlund/uucode/archive/ea62149739404a73c202b48a33bf6dd2af4bd9b0.tar.gz";
+      url = "https://deps.files.ghostty.org/uucode-ea62149739404a73c202b48a33bf6dd2af4bd9b0.tar.gz";
       hash = "sha256-dKrRJhFThGSdv5k6pEF2adGZIKxUQssAO30XAtLOFQ8=";
     };
     "vaxis-0.6.0-BWNV_MafDAAEzkVUvrW9NFUqnnMUoeHqrs2mecnD6D7w" = fetchzip {
       name = "vaxis";
-      url = "https://github.com/rockorager/libvaxis/archive/6fd944a27fb3d6f596e981076381a3131f2448b4.tar.gz";
+      url = "https://deps.files.ghostty.org/vaxis-6fd944a27fb3d6f596e981076381a3131f2448b4.tar.gz";
       hash = "sha256-jXHnvLMpER4Z1FmiN1NBnHlYJH6vQ2XB8CSyTPezYwY=";
     };
     "N-V-__8AAKrHGAAs2shYq8UkE6bGcR1QJtLTyOE_lcosMn6t" = fetchzip {
@@ -190,12 +190,12 @@
     };
     "z2d-0.12.2-pre-j5P_HilCEQDH_2RC0PZqYQd4rHTl13b-VXpaDQ1sE4kZ" = fetchzip {
       name = "z2d";
-      url = "https://github.com/vancluever/z2d/archive/f3cf28188dae39946964c81475ff234c008125a6.tar.gz";
+      url = "https://deps.files.ghostty.org/z2d-f3cf28188dae39946964c81475ff234c008125a6.tar.gz";
       hash = "sha256-VF45ZKB+EWy219JTRSWSo+SnXJXsdztfWe8Wa5fGB+k=";
     };
     "zf-0.11.0-OIRy8XCRAAB6FiMwIrtD6FqlagnFwpI6YyOu7bXeYH5J" = fetchzip {
       name = "zf";
-      url = "https://github.com/natecraddock/zf/archive/87153bb86b75d21fbac897b738f316d449f5d0c9.tar.gz";
+      url = "https://deps.files.ghostty.org/zf-87153bb86b75d21fbac897b738f316d449f5d0c9.tar.gz";
       hash = "sha256-ekfl/d+RAdCAjYC75bbAn/srS7RlfE2cuUGZLYg1ACw=";
     };
     "zig_js-0.0.0-rjCAV7-GAADvMTBL7lPMuvDk7xgS9PCMIZWiOUXLZSlj" = fetchzip {
@@ -205,12 +205,12 @@
     };
     "zig_objc-0.0.0-Ir_Sp_4tAQDXtPi51nW_jD9LOEzBvU9lofwO9Pzi6IB4" = fetchzip {
       name = "zig_objc";
-      url = "https://github.com/mitchellh/zig-objc/archive/3352c12a868f8787ab71bf2ca6eab9fcfb635c52.tar.gz";
+      url = "https://deps.files.ghostty.org/zig_objc-3352c12a868f8787ab71bf2ca6eab9fcfb635c52.tar.gz";
       hash = "sha256-aapY5DWn7QITFfMKc04bwH2a6sersRXvOhvkHE6t8LQ=";
     };
     "wayland-0.7.0-dev-lQa1klz9AQB87V0pMKMdm8JvyOx32XR9FxcWnw9wh6XZ" = fetchzip {
       name = "zig_wayland";
-      url = "https://codeberg.org/ifreund/zig-wayland/archive/27dda01712ddf3cb46ebd93380d88b01a7c828f8.tar.gz";
+      url = "https://deps.files.ghostty.org/zig_wayland-27dda01712ddf3cb46ebd93380d88b01a7c828f8.tar.gz";
       hash = "sha256-rtPmYAd+suOBW9bPmP42Tv1NGK+U5W0EDqpkakD8gtY=";
     };
     "zigimg-0.1.0-8_eo2ri_FwBqF5UYiggLz4IGjHJO_n9-B6gT9Ayqg8G4" = fetchZigGit {
