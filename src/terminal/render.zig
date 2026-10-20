@@ -690,8 +690,10 @@ pub const RenderState = struct {
         rows: u32,
 
         /// Where the image starts within the top-left cell, in pixels.
-        /// An image that doesn't fill its cells is centered, so these
-        /// can be larger than one cell.
+        /// For a virtual run, an image that doesn't fill its cells is
+        /// centered, so these can be larger than one cell. For fixed and
+        /// relative placements, these are the offsets the program asked
+        /// for, limited to less than one cell.
         offset_x: u32,
         offset_y: u32,
 
@@ -734,7 +736,7 @@ pub const RenderState = struct {
 
         /// Placements that already have their final position, returned
         /// after all of the placeholder runs. These are the placements
-        /// that are not placeholder runs, such as relative placements.
+        /// that are not placeholder runs: fixed and relative placements.
         placed: []const ImagePlacement,
 
         /// The current index into `rows`.

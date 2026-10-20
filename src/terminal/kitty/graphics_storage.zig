@@ -81,7 +81,10 @@ pub const ImageStorage = struct {
     /// The counter is never reset. Instead, each consumer keeps the last
     /// value it saw and compares it to the current value. Because nothing
     /// clears the counter, any number of consumers can watch the same
-    /// storage independently. For example:
+    /// storage independently. Within Ghostty, only `RenderState` reads
+    /// it, to know when to position its placements again. A renderer
+    /// should watch `RenderState.imagePlacementsGeneration` instead. For
+    /// example, a consumer of the storage would do:
     ///
     ///     if (storage.dirty != self.last_dirty) {
     ///         self.last_dirty = storage.dirty;
@@ -98,9 +101,10 @@ pub const ImageStorage = struct {
     /// positions on screen may have moved.
     ///
     /// Update this with `markDirty` or `markMutated` rather than writing
-    /// it directly. The one exception is `Terminal.switchScreen`, which
+    /// it directly. There are two exceptions. `Terminal.switchScreen`
     /// sets the new screen's counter past the old screen's so that a
-    /// consumer can never see the same value on both screens.
+    /// consumer can never see the same value on both screens, and
+    /// `Screen.reset` carries the counter over to the new storage.
     dirty: u64 = 0,
 
     /// Generation stamp of the last content mutation to this storage:

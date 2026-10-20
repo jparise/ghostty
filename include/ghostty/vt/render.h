@@ -846,16 +846,20 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_RENDER_STATE_IMAGE_DATA_Z = 5,
 
   /** The column of the top-left cell (int32_t), where 0 is the leftmost
-   *  column of the viewport. A placement can start to the left of the
-   *  viewport, which gives a negative value. See "Images Partly Outside
-   *  the Captured Rows" in the @ref render documentation. */
+   *  column of the viewport. Fixed and relative placements are reported
+   *  at their full size, so they can start to the left of the viewport,
+   *  which gives a negative value. Virtual placements never do. See
+   *  "Images Partly Outside the Captured Rows" in the @ref render
+   *  documentation. */
   GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_COL = 6,
 
   /** The row of the top-left cell (int32_t), where 0 is the top row of
    *  the viewport. A placement in an overscan row above the viewport has
    *  a negative row, the same as GHOSTTY_RENDER_STATE_ROW_DATA_VIEWPORT_Y.
-   *  A placement can also start above the first overscan row. See "Images Partly Outside the Captured Rows" in the
-   *  @ref render documentation. */
+   *  Fixed and relative placements are reported at their full size, so
+   *  they can also start above the first overscan row. Virtual
+   *  placements are always inside the captured rows. See "Images Partly
+   *  Outside the Captured Rows" in the @ref render documentation. */
   GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_ROW = 7,
 
   /** The number of columns of cells the placement covers (uint32_t). */
@@ -865,13 +869,17 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_RENDER_STATE_IMAGE_DATA_GRID_ROWS = 9,
 
   /** How far the image starts from the left edge of the top-left cell,
-   *  in pixels (uint32_t). An image that is narrower than its cells is
-   *  centered, so this can be larger than a cell is wide. */
+   *  in pixels (uint32_t). For a virtual placement, an image that is
+   *  narrower than its cells is centered, so this can be larger than a
+   *  cell is wide. For fixed and relative placements, this is the offset
+   *  the program asked for, limited to less than one cell. */
   GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_X = 10,
 
   /** How far the image starts from the top edge of the top-left cell,
-   *  in pixels (uint32_t). An image that is shorter than its cells is
-   *  centered, so this can be larger than a cell is tall. */
+   *  in pixels (uint32_t). For a virtual placement, an image that is
+   *  shorter than its cells is centered, so this can be larger than a
+   *  cell is tall. For fixed and relative placements, this is the offset
+   *  the program asked for, limited to less than one cell. */
   GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_Y = 11,
 
   /** The width to draw the image at, in pixels (uint32_t). */
@@ -902,8 +910,8 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *  For a virtual placement, this is the placement ID that the
    *  placeholder cells ask for. Cells that don't ask for one show the
    *  image's virtual placement, whichever it is, and report 0. For a
-   *  relative placement, this is the ID the program gave it, or 0 if it
-   *  didn't give one. */
+   *  fixed or relative placement, this is the ID the program gave it, or
+   *  0 if it didn't give one. */
   GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_PLACEMENT_ID = 18,
 
   /** Kitty graphics only: the kind of placement
