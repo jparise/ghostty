@@ -33,6 +33,11 @@ pub const State = struct {
     /// on frame builds and are generally more expensive to handle.
     kitty_virtual: bool,
 
+    /// The active screen's `ImageStorage.dirty` value at the time of our
+    /// last Kitty update. If the storage now holds a different value,
+    /// our placements are out of date and must be rebuilt.
+    kitty_dirty: u64,
+
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
 
@@ -42,6 +47,7 @@ pub const State = struct {
         .kitty_bg_end = 0,
         .kitty_text_end = 0,
         .kitty_virtual = false,
+        .kitty_dirty = 0,
         .overlay_placements = .empty,
     };
 
@@ -238,8 +244,8 @@ pub const State = struct {
         t: *const terminal.Terminal,
         render_state: *const terminal.RenderState,
     ) bool {
-        // If the terminal kitty image state is dirty, we must update.
-        if (t.screens.active.kitty_images.dirty) return true;
+        // The images or their positions changed since our last update.
+        if (t.screens.active.kitty_images.dirty != self.kitty_dirty) return true;
 
         // Images shown with placeholder cells move when the cells change,
         // so with any virtual placements we update whenever the render
@@ -262,7 +268,10 @@ pub const State = struct {
         render_state: *const terminal.RenderState,
     ) void {
         const storage = &t.screens.active.kitty_images;
-        defer storage.dirty = false;
+
+        // Remember the value we are building from so kittyRequiresUpdate
+        // can tell when it changes again.
+        self.kitty_dirty = storage.dirty;
 
         // We always clear our previous placements no matter what because
         // we rebuild them from scratch.
