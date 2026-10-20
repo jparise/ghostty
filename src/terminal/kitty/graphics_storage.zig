@@ -103,6 +103,20 @@ pub const ImageStorage = struct {
     /// This field must only be written via markMutated.
     generation: u64 = 0,
 
+    /// The storage generation at the end of the last animationTick
+    /// that found nothing to play. Null if the last tick found
+    /// something to play, or if no tick has run yet.
+    ///
+    /// This lets animationTick skip walking every image when nothing
+    /// changed since it last found nothing to play. That shortcut is
+    /// safe for two reasons. First, every change that can start an
+    /// animation updates the generation through markMutated. That
+    /// includes animation commands, new frames, new placements,
+    /// replaced images and finished image loads. Second, none of the
+    /// reasons an image doesn't animate go away just because time
+    /// passes.
+    animation_idle_generation: ?u64 = null,
+
     /// This is the next automatically assigned image ID for images
     /// transmitted without an ID or number. We start mid-way through
     /// the u32 range to stay clear of the low IDs client programs
@@ -1054,7 +1068,16 @@ pub const ImageStorage = struct {
     /// choosing. The same clock must be used for every call. The
     /// caller is expected to be the renderer, ticking once per frame
     /// build and scheduling a wakeup for the returned delay.
+    ///
+    /// When nothing is playing and the storage hasn't changed since
+    /// the last tick, this returns null right away instead of looking
+    /// at every image.
     pub fn animationTick(self: *ImageStorage, io: std.Io, now_ms: u64) ?u64 {
+        // Nothing changed since the last tick found nothing to play,
+        // so there is still nothing to play. See
+        // animation_idle_generation.
+        if (self.animation_idle_generation == self.generation) return null;
+
         var min_delay: ?u64 = null;
 
         var it = self.images.iterator();
@@ -1159,6 +1182,15 @@ pub const ImageStorage = struct {
                 min_delay = if (min_delay) |m| @min(m, delay) else delay;
             }
         }
+
+        // Remember the generation only when nothing is playing. We
+        // read it after the loop because showing a new frame above
+        // changes it. That case always schedules another tick, so it
+        // never records a stale value here.
+        self.animation_idle_generation = if (min_delay == null)
+            self.generation
+        else
+            null;
 
         return min_delay;
     }
@@ -4531,11 +4563,13 @@ test "storage: animation tick loading state parks on last frame" {
     try testing.expectEqual(@as(u32, 1), anim.current_index);
     try testing.expectEqual(@as(u32, 0), anim.current_loop);
 
-    // A new frame arriving un-parks playback.
+    // A new frame arriving resumes playback. The real frame command
+    // calls markMutated, so we do the same by hand.
     try anim.frames.append(alloc, .{
         .data = try alloc.dupe(u8, &.{ 0, 255, 0, 255 }),
         .gap_ms = 25,
     });
+    s.markMutated(io);
     try testing.expectEqual(@as(?u64, 25), s.animationTick(io, 150));
     try testing.expectEqual(@as(u32, 2), anim.current_index);
 }
@@ -4622,11 +4656,63 @@ test "storage: animation tick ignores ineligible animations" {
     // Stopped (the default) never advances.
     try testing.expect(s.animationTick(io, 0) == null);
 
-    // An all-gapless animation can never advance either.
+    // An all-gapless animation can never advance either. The real
+    // a=a command calls markMutated, so we do the same by hand.
     anim.state = .running;
     anim.frames.items[0].gap_ms = 0;
+    s.markMutated(io);
     try testing.expect(s.animationTick(io, 0) == null);
     try testing.expectEqual(@as(u32, 0), anim.current_index);
+}
+
+test "storage: animation tick skips the walk while idle" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 100;
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // A placed 1x1 RGBA image with one extra frame, in the default
+    // stopped state.
+    try s.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 1,
+        .format = .rgba,
+        .data = .{ .complete = try alloc.dupe(u8, &.{ 255, 0, 0, 255 }) },
+    });
+    const anim = try alloc.create(animation.Animation);
+    anim.* = .{};
+    s.images.getPtr(1).?.animation = anim;
+    try anim.frames.append(alloc, .{
+        .data = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }),
+        .gap_ms = 40,
+    });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+    });
+
+    // Nothing can play, so the tick records the current generation.
+    try testing.expect(s.animationTick(io, 0) == null);
+    try testing.expectEqual(@as(?u64, s.generation), s.animation_idle_generation);
+
+    // Changing the state directly, without markMutated, leaves the
+    // generation alone. The next tick returns early and doesn't see
+    // the change, which proves it skipped the walk.
+    anim.state = .running;
+    try testing.expect(s.animationTick(io, 10) == null);
+    try testing.expectEqual(@as(u32, 0), anim.current_index);
+
+    // Once the change is recorded, the tick looks again and plays.
+    s.markMutated(io);
+    try testing.expectEqual(@as(?u64, 40), s.animationTick(io, 20));
+    try testing.expectEqual(@as(u32, 1), anim.current_index);
+    try testing.expect(s.animation_idle_generation == null);
 }
 
 test "storage: animation tick re-anchors a restarted clock" {
