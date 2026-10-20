@@ -6678,8 +6678,8 @@ test "queueIo frees allocated writes in readonly mode" {
 
 test "Mouse.click_state holds every button" {
     var mouse: Mouse = .{};
-    inline for (@typeInfo(input.MouseButton).@"enum".fields) |field| {
-        mouse.click_state[@intCast(field.value)] = .press;
+    inline for (@typeInfo(input.MouseButton).@"enum".field_values) |value| {
+        mouse.click_state[@intCast(value)] = .press;
     }
     for (mouse.click_state) |state| {
         try std.testing.expectEqual(.press, state);
