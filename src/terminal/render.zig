@@ -182,18 +182,19 @@ const log = std.log.scoped(.render_state);
 ///
 /// ### Which Images Are Included
 ///
-/// The list currently holds these Kitty graphics images:
+/// The list holds every Kitty graphics image on screen:
 ///
 ///   - Images shown with placeholder cells. See "Kitty Graphics
 ///     Placeholders" below.
 ///   - Images placed at a cell on the screen. These scroll with the
 ///     text around them, like a line of output. See "Kitty Graphics
 ///     Fixed Placements" below.
-///   - Images placed relative to an image shown with placeholder cells.
+///   - Images placed relative to another image. See "Kitty Graphics
+///     Relative Placements" below.
 ///
-/// Images placed relative to an image at a cell on the screen are not in
-/// the list yet. Read only those from the terminal's Kitty image storage.
-/// Any other image you draw from the storage is drawn twice.
+/// You don't need to read the terminal's Kitty image storage to find
+/// what to draw. Don't draw images from the storage as well, or they are
+/// drawn twice.
 ///
 /// ### Images Partly Outside the Captured Rows
 ///
@@ -255,6 +256,28 @@ const log = std.log.scoped(.render_state);
 ///      images or the cell size changed.
 ///   3. Relative placements attached to a virtual placement are
 ///      positioned from that placement's runs.
+///
+/// ### Kitty Graphics Relative Placements
+///
+/// A program can also place a Kitty image relative to another placement,
+/// its parent. The image is drawn a number of cells to the right of and
+/// below its parent. Negative numbers move it left or up. The parent can
+/// be relative to another placement too, so placements can form a chain.
+///
+/// The render state follows the chain to the placement at its start and
+/// positions the image from there:
+///
+///   - If the chain starts at an image placed at a cell, the image is
+///     drawn from that cell, and moves whenever that cell moves.
+///   - If the chain starts at a virtual placement, the image is drawn
+///     from the top-left corner of that placement's placeholder cells.
+///     If none of those cells are in the captured rows, the image is not
+///     in the list.
+///
+/// For example, an image placed 3 columns right of and 2 rows below a
+/// parent at column 2, row 1 is drawn at column 5, row 3. Like other
+/// placements, it is in the list when any part of it is in the captured
+/// rows, even if its parent isn't.
 ///
 /// ## Memory
 ///
@@ -1854,8 +1877,10 @@ const Kitty = struct {
             // none of the parent's cells are in the captured rows, the
             // relative placement is not reported.
             //
-            // Relative placements with a fixed parent are not reported
-            // yet.
+            // With a fixed parent, the position is measured from the
+            // parent's cell, which is the cell its `x` and `y` report.
+            // The relative placement is reported when any part of it is
+            // in the captured rows, even if the parent isn't.
             "relative",
 
             // A placement at a cell on the screen. It scrolls with the
@@ -2036,7 +2061,9 @@ const Kitty = struct {
         virtual: PlacementKey,
 
         /// The cell of a fixed placement, as the pin that the image
-        /// storage keeps for it. The page list moves this pin as text
+        /// storage keeps for it. A fixed placement uses its own pin. A
+        /// relative placement uses the pin of the fixed placement at the
+        /// start of its chain. The page list moves this pin as text
         /// moves, so it is always current.
         ///
         /// The pointer is owned by the image storage. It is only read
@@ -2399,21 +2426,14 @@ const Kitty = struct {
                     // Follow the chain of parents to the placement at its
                     // start. A broken chain is never drawn.
                     const chain = storage.resolveChain(rel) orelse continue;
-                    switch (chain.root.location) {
-                        .virtual => {},
-
-                        // Chains that start at a fixed placement aren't
-                        // reported yet. The renderer still draws them from
-                        // the image storage. A later change gives them a
-                        // `pin` anchor here.
-                        .pin => continue,
-
-                        // resolveChain roots are never relative.
-                        .relative => unreachable,
-                    }
-
                     break :root .{
-                        .anchor = .{ .virtual = chain.root_key },
+                        .anchor = switch (chain.root.location) {
+                            .virtual => .{ .virtual = chain.root_key },
+                            .pin => |pin| .{ .pin = pin },
+
+                            // resolveChain roots are never relative.
+                            .relative => unreachable,
+                        },
                         .horizontal_offset = chain.horizontal_offset,
                         .vertical_offset = chain.vertical_offset,
                         .placement = template(
@@ -5318,6 +5338,339 @@ test "fixed: screen switch rebuilds roots" {
     const p = try testOnlyPlacement(&state);
     try testing.expectEqual(3, p.x);
     try testing.expectEqual(2, p.y);
+}
+
+/// Adds a Kitty placement of image 1 relative to another placement of
+/// image 1, for the `fixed: relative` tests.
+fn testRelativePlacement(
+    t: *Terminal,
+    placement_id: u32,
+    parent_id: u32,
+    horizontal_offset: i32,
+    vertical_offset: i32,
+    columns: u32,
+    rows: u32,
+) !void {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const s = t.screens.active;
+    try s.kitty_images.addPlacement(io, alloc, s, 1, placement_id, .{
+        .location = .{ .relative = .{
+            .parent = .{
+                .image_id = 1,
+                .placement_id = .{ .tag = .external, .id = parent_id },
+            },
+            .horizontal_offset = horizontal_offset,
+            .vertical_offset = vertical_offset,
+        } },
+        .columns = columns,
+        .rows = rows,
+    });
+}
+
+/// Returns the image placement of a render state with the given
+/// placement ID, failing the test if there isn't exactly one.
+fn testPlacementById(
+    state: *const RenderState,
+    placement_id: u32,
+) !RenderState.ImagePlacement {
+    var result: ?RenderState.ImagePlacement = null;
+    var it = state.imagePlacementIterator();
+    while (it.next()) |p| {
+        if (p.protocol.kitty.placement_id != placement_id) continue;
+        if (result != null) return error.TestUnexpectedPlacement;
+        result = p;
+    }
+    return result orelse error.TestExpectedPlacement;
+}
+
+test "fixed: relative child at parent plus positive offsets" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 100;
+
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 2, 1, 1, 1);
+    try testRelativePlacement(&t, 2, 1, 3, 2, 2, 3);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const parent = try testPlacementById(&state, 1);
+    try testing.expectEqual(RenderState.KittyPlacement.Kind.fixed, parent.protocol.kitty.kind);
+    try testing.expectEqual(2, parent.x);
+    try testing.expectEqual(1, parent.y);
+
+    const child = try testPlacementById(&state, 2);
+    try testing.expectEqual(RenderState.KittyPlacement.Kind.relative, child.protocol.kitty.kind);
+    try testing.expectEqual(1, child.image_id);
+    try testing.expectEqual(5, child.x);
+    try testing.expectEqual(3, child.y);
+    try testing.expectEqual(2, child.cols);
+    try testing.expectEqual(3, child.rows);
+    try testing.expectEqual(20, child.width);
+    try testing.expectEqual(30, child.height);
+}
+
+test "fixed: relative child with negative offsets" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 100;
+
+    // The child hangs above and left of its parent at the top-left
+    // corner. It is reported whole even though its top-left cell is
+    // outside the screen.
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 0, 0, 1, 1);
+    try testRelativePlacement(&t, 2, 1, -1, -1, 2, 2);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const child = try testPlacementById(&state, 2);
+    try testing.expectEqual(RenderState.KittyPlacement.Kind.relative, child.protocol.kitty.kind);
+    try testing.expectEqual(-1, child.x);
+    try testing.expectEqual(-1, child.y);
+    try testing.expectEqual(2, child.cols);
+    try testing.expectEqual(2, child.rows);
+}
+
+test "fixed: relative chain two levels deep" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 100;
+
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 1, 1, 1, 1);
+    try testRelativePlacement(&t, 2, 1, 1, 1, 1, 1);
+    try testRelativePlacement(&t, 3, 2, 2, 1, 1, 1);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const child = try testPlacementById(&state, 2);
+    try testing.expectEqual(2, child.x);
+    try testing.expectEqual(2, child.y);
+    const grandchild = try testPlacementById(&state, 3);
+    try testing.expectEqual(RenderState.KittyPlacement.Kind.relative, grandchild.protocol.kitty.kind);
+    try testing.expectEqual(4, grandchild.x);
+    try testing.expectEqual(3, grandchild.y);
+}
+
+test "fixed: relative to a parent above the captured rows" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{
+        .rows = 5,
+        .cols = 10,
+        .max_scrollback_bytes = null,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 50;
+    const pages = &t.screens.active.pages;
+    const first = pages.pages.first.?;
+    const page_rows: usize = first.capacity().rows;
+
+    // The parent is on the first row, and the child is far enough below
+    // it to be on the second row of the viewport once the parent scrolls
+    // onto an earlier page.
+    const distance = page_rows + 6;
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 1, 0, 1, 1);
+    try testRelativePlacement(&t, 2, 1, 2, @intCast(distance + 1), 1, 1);
+    t.setCursorPos(5, 1);
+    for (0..distance) |_| try t.index();
+    try testing.expect(pages.getTopLeft(.viewport).node == first.next.?);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // Only the child is in the captured rows. The parent's page is only
+    // found by the walk up.
+    try testing.expectEqual(1, state.kitty.chunks.items.len);
+    try testing.expect(state.kitty.chunks.items[0].node != first);
+    const p = try testOnlyPlacement(&state);
+    try testing.expectEqual(RenderState.KittyPlacement.Kind.relative, p.protocol.kitty.kind);
+    try testing.expectEqual(2, p.protocol.kitty.placement_id);
+    try testing.expectEqual(3, p.x);
+    try testing.expectEqual(1, p.y);
+}
+
+test "fixed: relative to a parent below the captured rows" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{
+        .rows = 5,
+        .cols = 10,
+        .max_scrollback_bytes = null,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 50;
+    const pages = &t.screens.active.pages;
+    const first = pages.pages.first.?;
+    const page_rows: usize = first.capacity().rows;
+
+    // Enough output that the active area is on a later page than the top
+    // of the scrollback, where the viewport goes.
+    t.setCursorPos(5, 1);
+    for (0..page_rows + 10) |_| try t.index();
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 1, 0, 1, 1);
+    const parent_pin = pages.pin(.{ .active = .{ .x = 1, .y = 0 } }).?;
+    try testing.expect(parent_pin.node != first);
+    const parent_y: i32 = @intCast(pages.pointFromPin(.screen, parent_pin).?.screen.y);
+
+    // The child moves up from the parent to the second row of the top of
+    // the scrollback.
+    try testRelativePlacement(&t, 2, 1, 1, 1 - parent_y, 1, 1);
+    t.scrollViewport(.top);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(1, state.kitty.chunks.items.len);
+    try testing.expectEqual(first, state.kitty.chunks.items[0].node);
+    const p = try testOnlyPlacement(&state);
+    try testing.expectEqual(RenderState.KittyPlacement.Kind.relative, p.protocol.kitty.kind);
+    try testing.expectEqual(2, p.x);
+    try testing.expectEqual(1, p.y);
+}
+
+test "fixed: relative with a broken chain is not drawn" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 50;
+
+    // Placement 99 doesn't exist.
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 1, 1, 1, 1);
+    try testRelativePlacement(&t, 2, 99, 1, 1, 1, 1);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const p = try testOnlyPlacement(&state);
+    try testing.expectEqual(1, p.protocol.kitty.placement_id);
+    try testing.expectEqual(1, state.kitty.roots.items.len);
+}
+
+test "fixed: relative to a parent with a garbage pin is not drawn" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{
+        .rows = 5,
+        .cols = 10,
+        .max_scrollback_bytes = null,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 50;
+
+    // The parent is on the first page, scrolled onto the second page's
+    // history. The child is far enough below it to be in the viewport.
+    const pages = &t.screens.active.pages;
+    const page_rows: usize = pages.pages.first.?.capacity().rows;
+    const distance = page_rows + 6;
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 0, 0, 1, 1);
+    try testRelativePlacement(&t, 2, 1, 0, @intCast(distance + 1), 1, 1);
+    t.setCursorPos(5, 1);
+    for (0..distance) |_| try t.index();
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqual(2, (try testOnlyPlacement(&state)).protocol.kitty.placement_id);
+
+    // Pruning the first page makes the parent's pin garbage without a
+    // generation change.
+    const storage = &t.screens.active.kitty_images;
+    const generation = storage.generation;
+    t.setScrollbackMaxLines(1);
+    try testing.expectEqual(generation, storage.generation);
+    try testing.expect(storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?.location.pin.garbage);
+    try state.update(alloc, &t);
+    var it = state.imagePlacementIterator();
+    try testing.expect(it.next() == null);
+}
+
+test "fixed: relative moves with its parent on a region scroll" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .rows = 6, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+    try t.switchScreenMode(.@"1049", true);
+
+    try testFixedImage(&t, 1);
+    try testFixedPlacement(&t, 1, 2, 3, 1, 1);
+    try testRelativePlacement(&t, 2, 1, 1, 1, 1, 1);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqual(3, (try testPlacementById(&state, 1)).y);
+    try testing.expectEqual(4, (try testPlacementById(&state, 2)).y);
+    const placements_generation = state.imagePlacementsGeneration();
+
+    // Scroll rows 2 to 5 (1-based) up by one. Both move up a row, and
+    // the storage generation stays the same.
+    const storage = &t.screens.active.kitty_images;
+    const generation = storage.generation;
+    t.setTopAndBottomMargin(2, 5);
+    t.setCursorPos(5, 1);
+    try t.index();
+    try testing.expectEqual(generation, storage.generation);
+    try state.update(alloc, &t);
+    {
+        const parent = try testPlacementById(&state, 1);
+        try testing.expectEqual(2, parent.x);
+        try testing.expectEqual(2, parent.y);
+        const child = try testPlacementById(&state, 2);
+        try testing.expectEqual(3, child.x);
+        try testing.expectEqual(3, child.y);
+    }
+    try testing.expect(state.imagePlacementsGeneration() != placements_generation);
 }
 
 test "placeholders: relative rooted at a virtual placement in an overscan row" {

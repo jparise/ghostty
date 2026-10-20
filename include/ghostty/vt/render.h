@@ -228,28 +228,20 @@ extern "C" {
  *
  * ### Which Images Are Included
  *
- * The list currently holds these Kitty graphics images:
+ * The list holds every Kitty graphics image on screen:
  *
  *   - Images shown with placeholder cells. See "Kitty Graphics
  *     Placeholders" below.
  *   - Images placed at a cell on the screen. These scroll with the text
  *     around them, like a line of output. See "Kitty Graphics Fixed
  *     Placements" below.
- *   - Images placed relative to an image shown with placeholder cells.
+ *   - Images placed relative to another image. See "Kitty Graphics
+ *     Relative Placements" below.
  *
- * Images placed relative to an image at a cell on the screen are not in
- * the list yet. Read those from the Kitty graphics placement iterator,
- * as described in the @ref kitty_graphics documentation. Get each one's
- * position and size with ghostty_kitty_graphics_placement_render_info(),
- * and its z-index with ghostty_kitty_graphics_placement_get(). The
- * z-index also decides its layer, as described in
- * @ref GhosttyKittyPlacementLayer. Then sort all of your images by layer
- * and z-index as usual.
- *
- * Earlier versions did not include images placed at a cell on the screen.
- * If your renderer draws those from the Kitty graphics placement iterator,
- * draw only the relative placements described above from it now.
- * Otherwise those images are drawn twice.
+ * Earlier versions left some of these images out, so renderers had to
+ * draw them from the Kitty graphics placement iterator. That is no
+ * longer needed. If your renderer still draws images from that
+ * iterator, stop, or those images are drawn twice.
  *
  * ### Images Partly Outside the Captured Rows
  *
@@ -307,6 +299,28 @@ extern "C" {
  * a block of 10 columns by 4 rows of placeholders gives 4 placements,
  * each 10 cells wide and 1 cell tall, and each drawing a quarter of the
  * image. Drawn together, they form the whole image.
+ *
+ * ### Kitty Graphics Relative Placements
+ *
+ * A program can also place a Kitty image relative to another placement,
+ * its parent. The image is drawn a number of cells to the right of and
+ * below its parent. Negative numbers move it left or up. The parent can
+ * be relative to another placement too, so placements can form a chain.
+ *
+ * The render state follows the chain to the placement at its start and
+ * positions the image from there:
+ *
+ *   - If the chain starts at an image placed at a cell, the image is
+ *     drawn from that cell, and moves whenever that cell moves.
+ *   - If the chain starts at a virtual placement, the image is drawn from
+ *     the top-left corner of that placement's placeholder cells. If none
+ *     of those cells are in the captured rows, the image is not in the
+ *     list.
+ *
+ * For example, an image placed 3 columns right of and 2 rows below a
+ * parent at column 2, row 1 is drawn at column 5, row 3. Like other
+ * placements, it is in the list when any part of it is in the captured
+ * rows, even if its parent isn't.
  *
  * ### Example
  *
@@ -765,8 +779,13 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *  cells are in the captured rows (the viewport plus any overscan), the
    *  relative placement is not included.
    *
-   *  Relative placements with a fixed parent are not included yet. See
-   *  "Which Images Are Included" in the @ref render documentation. */
+   *  With a fixed parent, the position is measured from the parent's
+   *  cell. The relative placement is included at its full size when any
+   *  part of it is in the captured rows, even if the parent isn't, so it
+   *  may need to be clipped when drawn.
+   *
+   *  See "Kitty Graphics Relative Placements" in the @ref render
+   *  documentation. */
   GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_RELATIVE = 1,
 
   /** A placement at a cell on the screen. It scrolls with the text,
