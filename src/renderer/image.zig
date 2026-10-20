@@ -38,11 +38,11 @@ pub const State = struct {
     /// our placements are out of date and must be rebuilt.
     kitty_dirty: u64,
 
-    /// The render state's `imagesGeneration` at the time of our last
-    /// Kitty update. Images shown with placeholder cells come from the
+    /// The render state's `imagePlacementsGeneration` at the time of our
+    /// last Kitty update. Images shown with placeholder cells come from the
     /// render state, so when it returns a different value, our copies
     /// of those placements are out of date and must be rebuilt.
-    kitty_images_generation: u64,
+    kitty_placements_generation: u64,
 
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
@@ -54,7 +54,7 @@ pub const State = struct {
         .kitty_text_end = 0,
         .kitty_virtual = false,
         .kitty_dirty = 0,
-        .kitty_images_generation = 0,
+        .kitty_placements_generation = 0,
         .overlay_placements = .empty,
     };
 
@@ -260,7 +260,7 @@ pub const State = struct {
         // text elsewhere don't. If the virtual placements are removed,
         // the next update sets `kitty_virtual` back to false.
         if (self.kitty_virtual and
-            render_state.imagesGeneration() != self.kitty_images_generation) return true;
+            render_state.imagePlacementsGeneration() != self.kitty_placements_generation) return true;
 
         return false;
     }
@@ -281,7 +281,7 @@ pub const State = struct {
         // Remember the value we are building from so kittyRequiresUpdate
         // can tell when it changes again.
         self.kitty_dirty = storage.dirty;
-        self.kitty_images_generation = render_state.imagesGeneration();
+        self.kitty_placements_generation = render_state.imagePlacementsGeneration();
 
         // We always clear our previous placements no matter what because
         // we rebuild them from scratch.

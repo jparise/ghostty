@@ -137,33 +137,48 @@ const log = std.log.scoped(.render_state);
 ///
 /// ### Knowing When Images Changed
 ///
-/// Most updates leave the images alone. A program prints some text or
-/// moves the cursor, and every image stays where it was. Rather than
-/// read the image list on every frame, compare `imagesGeneration` with
-/// the value you saw the last time you read it:
+/// Most frames don't change any image. A program prints text or moves the
+/// cursor, and every image stays where it was. You don't need to rebuild
+/// your image draw list on those frames. After each update, call
+/// `imagePlacementsGeneration` and compare the result with the value from
+/// the last time you read the list. If the two match, the list is the
+/// same as before, and you can keep drawing what you built last time:
 ///
-///     // Kept by your renderer between frames. Null means the list
-///     // was never read.
-///     var images_generation: ?u64 = null;
+///     // Kept by your renderer between frames. Null until the list has
+///     // been read once, so that the first frame always reads it.
+///     var placements_generation: ?u64 = null;
 ///
 ///     // Each frame:
 ///     try state.update(alloc, &terminal);
-///     const generation = state.imagesGeneration();
-///     if (images_generation != generation) {
-///         images_generation = generation;
+///     const generation = state.imagePlacementsGeneration();
+///     if (placements_generation != generation) {
+///         placements_generation = generation;
 ///         rebuildImageDrawList(state.imagePlacementIterator());
 ///     }
+///     drawImageDrawList();
 ///
-/// The value changes when an update adds, removes, or moves an image,
-/// or changes what part of an image is shown. It stays the same when
-/// only text changes, as long as the changed rows had no Kitty
-/// placeholder cells before or after. Changing a row that has
-/// placeholder cells always changes the value, even when the row ends
-/// up showing the same images. So treat a new value as "read the list
-/// again", not as proof that something on screen moved.
+/// The value changes when an update adds or removes an image, moves one,
+/// changes which part of one is shown, or changes the pixels of one. It
+/// stays the same when only text changes, as long as the changed rows had
+/// no Kitty placeholder cells before or after the change. (See "Kitty
+/// Graphics Placeholders" below for what those are.)
+///
+/// A new value means "read the list again". It doesn't promise that
+/// anything on screen moved. The value can change even when every image
+/// ends up exactly where it was, for example:
+///
+///   - When a program rewrites a row that has placeholder cells.
+///   - When a program changes any image or placement while images shown
+///     with placeholder cells are on screen.
 ///
 /// Only compare the value for equality. It wraps around, so a larger
-/// value doesn't mean a newer one.
+/// value doesn't mean a newer one. It is always 0 when Kitty graphics are
+/// disabled.
+///
+/// Don't confuse this value with `ImagePlacement.image_generation`. That
+/// one belongs to a single image and tells you when to upload its pixels
+/// again. This one belongs to the whole list and tells you when to read
+/// the list again.
 ///
 /// ### Which Images Are Included
 ///
@@ -768,22 +783,21 @@ pub const RenderState = struct {
         };
     }
 
-    /// Returns a value that changes whenever an update changes what
-    /// `imagePlacementIterator` returns. If it is the same as the last
-    /// time you read the iterator, the placements are the same too, and
-    /// there is no need to read them again. See "Knowing When Images
-    /// Changed" in the `RenderState` docs for an example and for exactly
-    /// when the value changes.
+    /// Returns a value that changes whenever an update changes the
+    /// placements that `imagePlacementIterator` returns. If it matches the
+    /// value from the last time you read the iterator, the placements are
+    /// the same and you don't need to read them again. See "Knowing When
+    /// Images Changed" in the `RenderState` docs for an example and for
+    /// exactly when the value changes.
     ///
-    /// This is about the list of placements as a whole. It is not the
-    /// same as `ImagePlacement.image_generation`, which tells you when
-    /// the pixels of one image changed.
+    /// The value belongs to the whole list. To know when the pixels of a
+    /// single image changed, use `ImagePlacement.image_generation`.
     ///
     /// Only compare the value for equality. It is always 0 when Kitty
     /// graphics are disabled.
-    pub fn imagesGeneration(self: *const RenderState) u64 {
+    pub fn imagePlacementsGeneration(self: *const RenderState) u64 {
         if (comptime !build_options.kitty_graphics) return 0;
-        return self.kitty.images_generation;
+        return self.kitty.placements_generation;
     }
 
     pub const Cell = struct {
@@ -1798,11 +1812,11 @@ pub const RenderState = struct {
 ///      move when cells change, so the update keeps `placed` as it is.
 ///
 /// Each update also works out whether the iterator's output changed, for
-/// `RenderState.imagesGeneration`. The runs are easy, because a run only
-/// changes when its row is rebuilt or when it is looked up again. For
-/// `placed`, the update keeps the previous list in `placed_prev` and
-/// compares the two. In the example, step 1 and step 2 change the value,
-/// and step 3 doesn't.
+/// `RenderState.imagePlacementsGeneration`. The runs are easy, because a
+/// run only changes when its row is rebuilt or when it is looked up
+/// again. For `placed`, the update keeps the previous list in
+/// `placed_prev` and compares the two. In the example, step 1 and step 2
+/// change the value, and step 3 doesn't.
 const Kitty = struct {
     /// The Kitty image storage key of a placement, or void when Kitty
     /// graphics are disabled.
@@ -1982,10 +1996,10 @@ const Kitty = struct {
         /// stream of updates doesn't allocate.
         placed_prev: std.ArrayList(RenderState.ImagePlacement) = .empty,
 
-        /// The value returned by `RenderState.imagesGeneration`.
+        /// The value returned by `RenderState.imagePlacementsGeneration`.
         /// `updateSlow` adds one to it, wrapping around, when the
         /// iterator's output may have changed.
-        images_generation: u64 = 0,
+        placements_generation: u64 = 0,
 
         fn deinit(self: *Data, alloc: Allocator) void {
             self.roots.deinit(alloc);
@@ -2166,7 +2180,7 @@ const Kitty = struct {
         if (runs_changed or !placedEql(
             state.kitty.placed.items,
             state.kitty.placed_prev.items,
-        )) state.kitty.images_generation +%= 1;
+        )) state.kitty.placements_generation +%= 1;
     }
 
     /// Returns true if two lists hold the same placements in the same
@@ -5401,7 +5415,7 @@ fn testPlacementCount(state: *const RenderState) usize {
     return n;
 }
 
-test "images_generation: zero without images" {
+test "placements_generation: zero without images" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -5413,13 +5427,13 @@ test "images_generation: zero without images" {
     var state: RenderState = .empty;
     defer state.deinit(alloc);
     try state.update(alloc, &t);
-    try testing.expectEqual(0, state.imagesGeneration());
+    try testing.expectEqual(0, state.imagePlacementsGeneration());
     try t.printString("world");
     try state.update(alloc, &t);
-    try testing.expectEqual(0, state.imagesGeneration());
+    try testing.expectEqual(0, state.imagePlacementsGeneration());
 }
 
-test "images_generation: stable on a quiet update" {
+test "placements_generation: stable on a quiet update" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -5433,14 +5447,14 @@ test "images_generation: stable on a quiet update" {
     defer state.deinit(alloc);
     try state.update(alloc, &t);
     try testing.expectEqual(2, testPlacementCount(&state));
-    const generation = state.imagesGeneration();
+    const generation = state.imagePlacementsGeneration();
     try testing.expect(generation != 0);
 
     try state.update(alloc, &t);
-    try testing.expectEqual(generation, state.imagesGeneration());
+    try testing.expectEqual(generation, state.imagePlacementsGeneration());
 }
 
-test "images_generation: stable across a dirty row with only fixed placements" {
+test "placements_generation: stable across a dirty row with only fixed placements" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -5456,7 +5470,7 @@ test "images_generation: stable across a dirty row with only fixed placements" {
     var state: RenderState = .empty;
     defer state.deinit(alloc);
     try state.update(alloc, &t);
-    const generation = state.imagesGeneration();
+    const generation = state.imagePlacementsGeneration();
 
     // The slow path would build `placed` again and drop the marker.
     const poison = 12345;
@@ -5464,11 +5478,11 @@ test "images_generation: stable across a dirty row with only fixed placements" {
 
     t.screens.active.pages.pin(.{ .active = .{ .y = 3 } }).?.markDirty();
     try state.update(alloc, &t);
-    try testing.expectEqual(generation, state.imagesGeneration());
+    try testing.expectEqual(generation, state.imagePlacementsGeneration());
     try testing.expectEqual(poison, (try testOnlyPlacement(&state)).width);
 }
 
-test "images_generation: stable across a dirty row that has no placeholders while virtual runs exist elsewhere" {
+test "placements_generation: stable across a dirty row that has no placeholders while virtual runs exist elsewhere" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -5498,7 +5512,7 @@ test "images_generation: stable across a dirty row that has no placeholders whil
     try state.update(alloc, &t);
     try testing.expectEqual(3, testPlacementCount(&state));
     try testing.expect(state.kitty.virtual_anchors > 0);
-    const generation = state.imagesGeneration();
+    const generation = state.imagePlacementsGeneration();
 
     // Mark the row dirty directly. Moving the cursor would also rebuild
     // the placeholder row the cursor leaves.
@@ -5507,11 +5521,11 @@ test "images_generation: stable across a dirty row that has no placeholders whil
     try state.update(alloc, &t);
     try testing.expect(state.row_data.items(.dirty)[3]);
     try testing.expect(!state.row_data.items(.dirty)[1]);
-    try testing.expectEqual(generation, state.imagesGeneration());
+    try testing.expectEqual(generation, state.imagePlacementsGeneration());
     try testing.expectEqual(3, testPlacementCount(&state));
 }
 
-test "images_generation: changes when a placeholder row is overwritten with text" {
+test "placements_generation: changes when a placeholder row is overwritten with text" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -5525,19 +5539,19 @@ test "images_generation: changes when a placeholder row is overwritten with text
     defer state.deinit(alloc);
     try state.update(alloc, &t);
     try testing.expectEqual(2, testPlacementCount(&state));
-    const generation = state.imagesGeneration();
+    const generation = state.imagePlacementsGeneration();
 
     t.screens.active.cursorAbsolute(3, 1);
     try t.printString("x");
     try state.update(alloc, &t);
-    try testing.expect(generation != state.imagesGeneration());
+    try testing.expect(generation != state.imagePlacementsGeneration());
 
     // Only the fixed placement is left.
     const p = try testOnlyPlacement(&state);
     try testing.expectEqual(RenderState.KittyPlacement.Kind.fixed, p.protocol.kitty.kind);
 }
 
-test "images_generation: changes when a placeholder run is added" {
+test "placements_generation: changes when a placeholder run is added" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -5550,18 +5564,18 @@ test "images_generation: changes when a placeholder run is added" {
     var state: RenderState = .empty;
     defer state.deinit(alloc);
     try state.update(alloc, &t);
-    const generation = state.imagesGeneration();
+    const generation = state.imagePlacementsGeneration();
 
     try t.setAttribute(.{ .@"256_fg" = 1 });
     try t.setAttribute(.{ .@"256_underline_color" = 2 });
     t.screens.active.cursorAbsolute(5, 2);
     try t.printString("\u{10EEEE}\u{0305}\u{0305}");
     try state.update(alloc, &t);
-    try testing.expect(generation != state.imagesGeneration());
+    try testing.expect(generation != state.imagePlacementsGeneration());
     try testing.expectEqual(3, testPlacementCount(&state));
 }
 
-test "images_generation: changes on viewport scroll with a fixed placement" {
+test "placements_generation: changes on viewport scroll with a fixed placement" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -5585,20 +5599,20 @@ test "images_generation: changes on viewport scroll with a fixed placement" {
     defer state.deinit(alloc);
     try state.update(alloc, &t);
     try testing.expectEqual(-1, (try testOnlyPlacement(&state)).y);
-    const generation = state.imagesGeneration();
+    const generation = state.imagePlacementsGeneration();
 
     t.scrollViewport(.{ .delta = -2 });
     try state.update(alloc, &t);
     try testing.expectEqual(1, (try testOnlyPlacement(&state)).y);
-    const scrolled = state.imagesGeneration();
+    const scrolled = state.imagePlacementsGeneration();
     try testing.expect(generation != scrolled);
 
     // Stable on a second update with no changes.
     try state.update(alloc, &t);
-    try testing.expectEqual(scrolled, state.imagesGeneration());
+    try testing.expectEqual(scrolled, state.imagePlacementsGeneration());
 }
 
-test "images_generation: changes on a storage mutation" {
+test "placements_generation: changes on a storage mutation" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -5611,30 +5625,30 @@ test "images_generation: changes on a storage mutation" {
     var state: RenderState = .empty;
     defer state.deinit(alloc);
     try state.update(alloc, &t);
-    var generation = state.imagesGeneration();
+    var generation = state.imagePlacementsGeneration();
 
     // Add a placement.
     try testFixedPlacement(&t, 4, 5, 0, 1, 1);
     try state.update(alloc, &t);
-    try testing.expect(generation != state.imagesGeneration());
+    try testing.expect(generation != state.imagePlacementsGeneration());
     try testing.expectEqual(3, testPlacementCount(&state));
-    generation = state.imagesGeneration();
+    generation = state.imagePlacementsGeneration();
 
     // Delete it again.
     const storage = &t.screens.active.kitty_images;
     storage.delete(io, alloc, &t, .{ .id = .{ .image_id = 1, .placement_id = 4 } });
     try state.update(alloc, &t);
-    try testing.expect(generation != state.imagesGeneration());
+    try testing.expect(generation != state.imagePlacementsGeneration());
     try testing.expectEqual(2, testPlacementCount(&state));
-    generation = state.imagesGeneration();
+    generation = state.imagePlacementsGeneration();
 
     // Any mutation, even one that doesn't move anything.
     storage.markMutated(io);
     try state.update(alloc, &t);
-    try testing.expect(generation != state.imagesGeneration());
+    try testing.expect(generation != state.imagePlacementsGeneration());
 }
 
-test "images_generation: changes on a region scroll that moves a fixed placement" {
+test "placements_generation: changes on a region scroll that moves a fixed placement" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -5653,7 +5667,7 @@ test "images_generation: changes on a region scroll that moves a fixed placement
     defer state.deinit(alloc);
     try state.update(alloc, &t);
     try testing.expectEqual(3, (try testOnlyPlacement(&state)).y);
-    const generation = state.imagesGeneration();
+    const generation = state.imagePlacementsGeneration();
 
     const storage = &t.screens.active.kitty_images;
     const storage_generation = storage.generation;
@@ -5663,5 +5677,5 @@ test "images_generation: changes on a region scroll that moves a fixed placement
     try testing.expectEqual(storage_generation, storage.generation);
     try state.update(alloc, &t);
     try testing.expectEqual(2, (try testOnlyPlacement(&state)).y);
-    try testing.expect(generation != state.imagesGeneration());
+    try testing.expect(generation != state.imagePlacementsGeneration());
 }

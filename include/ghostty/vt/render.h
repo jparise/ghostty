@@ -315,7 +315,9 @@ extern "C" {
  * GhosttyRenderStateImageIterator images = NULL;
  * ghostty_render_state_image_iterator_new(NULL, &images);
  *
- * // Each frame, after ghostty_render_state_update():
+ * // Each frame, after ghostty_render_state_update(). To skip this on
+ * // frames where no image changed, see "Knowing When Images Changed"
+ * // below.
  * ghostty_render_state_get(
  *     state, GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR, &images);
  *
@@ -384,6 +386,61 @@ extern "C" {
  * ghostty_render_state_image_iterator_free(images);
  * @endcode
  *
+ * ### Knowing When Images Changed
+ *
+ * Most frames don't change any image. A program prints text or moves the
+ * cursor, and every image stays where it was. You don't need to read the
+ * iterator again on those frames. After each update, read
+ * GHOSTTY_RENDER_STATE_DATA_IMAGE_PLACEMENTS_GENERATION and compare it
+ * with the value from the last time you read the list. If the two match,
+ * the list is the same as before, and you can keep drawing what you built
+ * last time:
+ *
+ * @code{.c}
+ * // Kept by your renderer between frames. The flag makes sure the first
+ * // frame always reads the list.
+ * uint64_t last_generation = 0;
+ * bool have_draw_list = false;
+ *
+ * // Each frame, after ghostty_render_state_update():
+ * uint64_t generation = 0;
+ * ghostty_render_state_get(
+ *     state, GHOSTTY_RENDER_STATE_DATA_IMAGE_PLACEMENTS_GENERATION,
+ *     &generation);
+ * if (!have_draw_list || generation != last_generation) {
+ *   last_generation = generation;
+ *   have_draw_list = true;
+ *
+ *   // Your renderer: read the iterator as in the example above and
+ *   // build a new queue of images to draw.
+ *   rebuild_image_queue(state, images);
+ * }
+ * draw_image_queue();
+ * @endcode
+ *
+ * The value changes when an update adds or removes an image, moves one,
+ * changes which part of one is shown, or changes the pixels of one. It
+ * stays the same when only text changes, as long as the changed rows had
+ * no Kitty placeholder cells before or after the change. (See "Kitty
+ * Graphics Placeholders" above for what those are.)
+ *
+ * A new value means "read the list again". It doesn't promise that
+ * anything on screen moved. The value can change even when every image
+ * ends up exactly where it was, for example:
+ *
+ *   - When a program rewrites a row that has placeholder cells.
+ *   - When a program changes any image or placement while images shown
+ *     with placeholder cells are on screen.
+ *
+ * Only compare the value for equality. It wraps around, so a larger value
+ * doesn't mean a newer one. It is always 0 when Kitty graphics are
+ * disabled.
+ *
+ * Don't confuse this value with
+ * GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_GENERATION. That one belongs to a
+ * single image and tells you when to upload its pixels again. This one
+ * belongs to the whole list and tells you when to read the list again.
+ *
  * ### Things to Keep in Mind
  *
  *   - **Image pixels are not copied.** The render state only knows where
@@ -399,7 +456,7 @@ extern "C" {
  *     Without it there is nothing to draw and the iterator is empty.
  *   - **Results last until the next update.** Like rows, they belong to
  *     the render state and can be read without access to the terminal.
- *     Fill the iterator again after every update.
+ *     After each update, fill the iterator again before you read it.
  *
  * ## Examples
  *
@@ -600,6 +657,21 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *  placements found by the last update. See "Images" in the render
    *  state overview. */
   GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR = 22,
+
+  /** A value (uint64_t) that changes whenever an update changes the
+   *  placements that GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR returns. If
+   *  it matches the value from the last time you read the iterator, the
+   *  placements are the same and you don't need to read them again. See
+   *  "Knowing When Images Changed" in the render state overview for an
+   *  example and for exactly when the value changes.
+   *
+   *  The value belongs to the whole list. To know when the pixels of a
+   *  single image changed, use
+   *  GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_GENERATION.
+   *
+   *  Only compare the value for equality. It is always 0 when Kitty
+   *  graphics are disabled. */
+  GHOSTTY_RENDER_STATE_DATA_IMAGE_PLACEMENTS_GENERATION = 23,
   GHOSTTY_RENDER_STATE_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateData;
 
@@ -739,7 +811,10 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *  moves to a new frame. Use it as part of your texture cache key,
    *  with the protocol and image ID: if it matches the texture you have,
    *  you don't need to read the pixels again. For Kitty graphics, this
-   *  is the same value as GHOSTTY_KITTY_IMAGE_DATA_GENERATION. */
+   *  is the same value as GHOSTTY_KITTY_IMAGE_DATA_GENERATION.
+   *
+   *  To know when the list of placements as a whole changed, use
+   *  GHOSTTY_RENDER_STATE_DATA_IMAGE_PLACEMENTS_GENERATION. */
   GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_GENERATION = 3,
 
   /** The layer to draw the image in (GhosttyRenderStateImageLayer). */
