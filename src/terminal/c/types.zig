@@ -329,6 +329,7 @@ const type_decls = [_]TypeDecl{
     .initEnumSentinel("GhosttySizeReportStyle", size_report.Style, "GHOSTTY_SIZE_REPORT_", "STYLE_MAX_VALUE"),
     .initEnum("GhosttySnapshotDecoderData", snapshot.DecoderData, "GHOSTTY_SNAPSHOT_DECODER_DATA_"),
     .initEnum("GhosttySnapshotDecoderOption", snapshot.DecoderOption, "GHOSTTY_SNAPSHOT_DECODER_OPT_"),
+    .initEnum("GhosttySnapshotDecoderProgressKind", snapshot.DecoderProgressKind, "GHOSTTY_SNAPSHOT_DECODER_PROGRESS_KIND_"),
     .initEnumSentinel("GhosttyStyleColorTag", style.ColorTag, "GHOSTTY_STYLE_COLOR_", "TAG_MAX_VALUE"),
     .initEnum("GhosttySysLogLevel", sys.LogLevel, "GHOSTTY_SYS_LOG_LEVEL_"),
     .initEnum("GhosttySysOption", sys.Option, "GHOSTTY_SYS_OPT_"),
