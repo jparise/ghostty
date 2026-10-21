@@ -1572,6 +1572,81 @@ test "complete snapshot rejects ordering and invalid markers" {
     );
 }
 
+test "complete snapshot skips unknown records in every position" {
+    const testing = std.testing;
+
+    // Put an unknown record before every record of the complete golden,
+    // including before FINISH, so one sits between every pair of records.
+    // The tags vary, and so do the payload lengths, including empty.
+    var with_unknown: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer with_unknown.deinit();
+    var unknown_offsets: std.ArrayList(usize) = .empty;
+    defer unknown_offsets.deinit(testing.allocator);
+    {
+        const bytes: []const u8 = &test_complete_fixture;
+        try with_unknown.writer.writeAll(bytes[0..envelope.encoded_len]);
+        var offset: usize = envelope.encoded_len;
+        var i: usize = 0;
+        while (offset < bytes.len) : (i += 1) {
+            const len = std.mem.readInt(u32, bytes[offset + 2 ..][0..4], .little);
+            const end = offset + record.Header.len + len;
+            try unknown_offsets.append(testing.allocator, with_unknown.written().len);
+            const payload: [8]u8 = @splat(@intCast(i));
+            try record.testWriteRaw(
+                &with_unknown.writer,
+                @intCast(0x4000 + i),
+                payload[0 .. i % payload.len],
+            );
+            try with_unknown.writer.writeAll(bytes[offset..end]);
+            offset = end;
+        }
+    }
+
+    // Both decoders restore exactly the terminal of the golden.
+    {
+        var source: std.Io.Reader = .fixed(with_unknown.written());
+        var decoded = try decodeExact(
+            testing.allocator,
+            testing.io,
+            &source,
+            test_decode_options,
+        );
+        defer decoded.deinit(testing.allocator);
+        var reencoded: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer reencoded.deinit();
+        try encode(testing.allocator, &reencoded.writer, &decoded.terminal.?, test_encode_options);
+        try testing.expectEqualSlices(u8, &test_complete_fixture, reencoded.written());
+    }
+    {
+        var source: std.Io.Reader = .fixed(with_unknown.written());
+        var buf: [1]u8 = undefined;
+        var limited = source.limited(.unlimited, &buf);
+        var decoder: Decoder = .init(&limited.interface);
+        var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
+        defer decoded.deinit(testing.allocator);
+        const restored = &decoded.terminal.?;
+        while (try decoder.next(testing.allocator, restored)) |_| {}
+        var reencoded: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer reencoded.deinit();
+        try encode(testing.allocator, &reencoded.writer, restored, test_encode_options);
+        try testing.expectEqualSlices(u8, &test_complete_fixture, reencoded.written());
+    }
+
+    // A corrupted unknown record still fails its CRC, wherever it is. The
+    // first payload byte is corrupted, or the tag when the payload is empty.
+    for (unknown_offsets.items) |offset| {
+        const corrupted = try testing.allocator.dupe(u8, with_unknown.written());
+        defer testing.allocator.free(corrupted);
+        const len = std.mem.readInt(u32, corrupted[offset + 2 ..][0..4], .little);
+        corrupted[if (len > 0) offset + record.Header.len else offset] ^= 0x01;
+        var source: std.Io.Reader = .fixed(corrupted);
+        try testing.expectError(
+            error.InvalidChecksum,
+            decode(testing.allocator, testing.io, &source, test_decode_options),
+        );
+    }
+}
+
 test "complete snapshot leaves continuation bytes unread" {
     const testing = std.testing;
 

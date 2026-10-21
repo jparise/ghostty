@@ -267,14 +267,11 @@ fn stepReport(ptr: *anyopaque) Benchmark.Error!void {
     const self: *TerminalSnapshot = @ptrCast(@alignCast(ptr));
     const bytes = self.encoded.written();
 
-    var payload_totals = std.enums.EnumArray(
-        snapshot.record.Tag,
-        u64,
-    ).initFill(0);
-    var record_counts = std.enums.EnumArray(
-        snapshot.record.Tag,
-        u64,
-    ).initFill(0);
+    // A record tag can hold values that `Tag` does not name, so totals are
+    // kept per named tag rather than in an EnumArray over every value.
+    const tags = comptime std.enums.values(snapshot.record.Tag);
+    var payload_totals: [tags.len]u64 = @splat(0);
+    var record_counts: [tags.len]u64 = @splat(0);
     var record_total: u64 = 0;
 
     var offset: usize = snapshot.envelope.encoded_len;
@@ -285,22 +282,25 @@ fn stepReport(ptr: *anyopaque) Benchmark.Error!void {
             bytes[offset + 2 ..][0..4],
             .little,
         );
-        const tag = std.enums.fromInt(snapshot.record.Tag, tag_raw) orelse {
+        const index = std.mem.indexOfScalar(
+            snapshot.record.Tag,
+            tags,
+            @fromBackingInt(tag_raw),
+        ) orelse {
             log.warn("unknown record tag {}", .{tag_raw});
             return error.BenchmarkFailed;
         };
-        payload_totals.getPtr(tag).* += payload_len;
-        record_counts.getPtr(tag).* += 1;
+        payload_totals[index] += payload_len;
+        record_counts[index] += 1;
         record_total += 1;
         offset += snapshot.record.Header.len + payload_len;
     }
 
-    var it = payload_totals.iterator();
-    while (it.next()) |entry| {
+    for (tags, payload_totals, record_counts) |tag, payload, records| {
         std.debug.print("terminal-snapshot tag={s} records={d} payload={d}\n", .{
-            @tagName(entry.key),
-            record_counts.get(entry.key),
-            entry.value.*,
+            @tagName(tag),
+            records,
+            payload,
         });
     }
     std.debug.print(
@@ -327,6 +327,19 @@ test "TerminalSnapshot decode round trip" {
     const testing = std.testing;
     const impl: *TerminalSnapshot = try .create(testing.allocator, .{
         .mode = .decode,
+        .@"terminal-rows" = 4,
+        .@"terminal-cols" = 8,
+    });
+    defer impl.destroy(testing.allocator);
+
+    const bench = impl.benchmark();
+    _ = try bench.run(.once);
+}
+
+test "TerminalSnapshot report" {
+    const testing = std.testing;
+    const impl: *TerminalSnapshot = try .create(testing.allocator, .{
+        .mode = .report,
         .@"terminal-rows" = 4,
         .@"terminal-cols" = 8,
     });

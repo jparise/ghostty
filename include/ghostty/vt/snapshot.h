@@ -109,6 +109,12 @@ extern "C" {
  * CRC32C, like every other record. Declared record counts, tags, and strict
  * decoding enforce the stream's ordering and completeness.
  *
+ * A decoder skips any record whose tag it does not know, wherever it
+ * appears. This lets a newer library add optional kinds of records that
+ * older libraries ignore, without changing the snapshot version. Skipped
+ * records are still checked, so a damaged record fails decoding even when
+ * its tag is unknown.
+ *
  * Snapshot format version 1 is a work in progress and does not yet carry a
  * binary-compatibility guarantee.
  *

@@ -18,8 +18,9 @@ https://ide.kaitai.io/.
 The generated Python parser exists only in a temporary directory. This keeps
 snapshot.ksy as the source of truth and ensures this check cannot accidentally
 pass against stale generated code. After structural parsing, the script checks
-record CRC32C values and cross-record invariants that portable Kaitai
-expressions cannot represent.
+what portable Kaitai expressions cannot represent: every record's CRC32C,
+including records with unknown tags, and the order, declared counts and screen
+keys of the known records.
 """
 
 from __future__ import annotations
@@ -187,28 +188,115 @@ def validate_record(record: Any, data: bytes, offset: int) -> int:
     return offset + RECORD_HEADER_SIZE + len(payload)
 
 
-def all_snapshot_records(snapshot: Any) -> list[Any]:
-    """Return complete-snapshot records in wire order."""
-    records = [snapshot.terminal]
-    for sequence in snapshot.screens:
-        records.append(sequence.screen)
-        records.extend(sequence.pages)
-    records.append(snapshot.continuation)
-    records.append(snapshot.ready)
-    for sequence in snapshot.histories:
-        records.append(sequence.history)
-        records.extend(sequence.pages)
-    records.append(snapshot.finish)
-    return records
+TAG_TERMINAL = 1
+TAG_SCREEN = 2
+TAG_PAGE = 3
+TAG_HISTORY = 4
+TAG_READY = 5
+TAG_FINISH = 6
+TAG_CONTINUATION = 7
+KNOWN_TAGS = set(range(TAG_TERMINAL, TAG_CONTINUATION + 1))
+
+
+@dataclass
+class Sequence:
+    """A SCREEN or HISTORY record and its PAGE records."""
+
+    record: Any
+    pages: list[Any]
+
+
+@dataclass
+class Structure:
+    """The known records of a complete snapshot, grouped by role."""
+
+    terminal: Any
+    screens: list[Sequence]
+    continuation: Any
+    histories: list[Sequence]
+
+
+class KnownRecords:
+    """Walk the known records in wire order, skipping unknown ones.
+
+    This mirrors the Zig decoder, which ignores records with unknown tags
+    wherever they appear. Their CRC32C values are still checked separately
+    by validate_record.
+    """
+
+    def __init__(self, snapshot: Any) -> None:
+        self.records = [
+            record
+            for record in snapshot.records
+            if record.header.tag in KNOWN_TAGS
+        ]
+        self.index = 0
+
+    def peek(self) -> int | None:
+        """Return the tag of the next known record, or None at the end."""
+        if self.index >= len(self.records):
+            return None
+        return self.records[self.index].header.tag
+
+    def take(self, tag: int) -> Any:
+        """Consume the next known record, which must have this tag."""
+        actual = self.peek()
+        if actual != tag:
+            raise ValueError(f"expected record tag {tag}, found {actual}")
+        record = self.records[self.index]
+        self.index += 1
+        return record
+
+    def take_sequence(self, tag: int, page_count: Any) -> Sequence:
+        """Consume a SCREEN or HISTORY record and the PAGE records it
+        declares. page_count reads the declared count from that record."""
+        record = self.take(tag)
+        pages = [self.take(TAG_PAGE) for _ in range(page_count(record))]
+        return Sequence(record, pages)
+
+
+def snapshot_structure(snapshot: Any) -> Structure:
+    """Group known records by role and validate their order."""
+    records = KnownRecords(snapshot)
+    terminal = records.take(TAG_TERMINAL)
+    screen_count = terminal.payload.header.screen_count
+
+    screens = [
+        records.take_sequence(
+            TAG_SCREEN,
+            lambda record: record.payload.header.page_count,
+        )
+        for _ in range(screen_count)
+    ]
+    continuation = records.take(TAG_CONTINUATION)
+    records.take(TAG_READY)
+    histories = [
+        records.take_sequence(
+            TAG_HISTORY,
+            lambda record: record.payload.page_count,
+        )
+        for _ in range(screen_count)
+    ]
+    records.take(TAG_FINISH)
+    if records.peek() is not None:
+        raise ValueError("records follow FINISH")
+
+    return Structure(
+        terminal=terminal,
+        screens=screens,
+        continuation=continuation,
+        histories=histories,
+    )
 
 
 def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
     """Validate ordering relationships, record CRCs, and markers."""
+    structure = snapshot_structure(snapshot)
     screen_keys = [
-        sequence.screen.payload.header.key for sequence in snapshot.screens
+        sequence.record.payload.header.key for sequence in structure.screens
     ]
     history_keys = [
-        sequence.history.payload.key for sequence in snapshot.histories
+        sequence.record.payload.key for sequence in structure.histories
     ]
     if len(set(screen_keys)) != len(screen_keys):
         raise ValueError("complete snapshot contains a duplicate SCREEN key")
@@ -217,7 +305,7 @@ def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
     if set(screen_keys) != set(history_keys):
         raise ValueError("SCREEN and HISTORY keys do not match")
 
-    terminal_header = snapshot.terminal.payload.header
+    terminal_header = structure.terminal.payload.header
     expected_key_values = (
         {0} if terminal_header.screen_count == 1 else {0, 1}
     )
@@ -229,11 +317,11 @@ def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
         )
 
     screens_by_key = {
-        sequence.screen.payload.header.key: sequence
-        for sequence in snapshot.screens
+        sequence.record.payload.header.key: sequence
+        for sequence in structure.screens
     }
-    for sequence in snapshot.screens:
-        header = sequence.screen.payload.header
+    for sequence in structure.screens:
+        header = sequence.record.payload.header
         if (
             header.cursor_x >= terminal_header.columns
             or header.cursor_y >= terminal_header.rows
@@ -244,8 +332,8 @@ def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
         ):
             raise ValueError(f"SCREEN key {header.key}: invalid cursor position")
 
-    for sequence in snapshot.histories:
-        payload = sequence.history.payload
+    for sequence in structure.histories:
+        payload = sequence.record.payload
         screen = screens_by_key[payload.key]
         screen_rows = sum(
             page.payload.header.rows for page in screen.pages
@@ -259,16 +347,14 @@ def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
         history_rows = overlap_rows + sum(
             page.payload.header.rows for page in sequence.pages
         )
-        if history_rows != screen.screen.payload.header.history_rows:
+        if history_rows != screen.record.payload.header.history_rows:
             raise ValueError(
                 f"SCREEN key {payload.key}: history_rows "
-                f"{screen.screen.payload.header.history_rows} "
+                f"{screen.record.payload.header.history_rows} "
                 f"does not match {history_rows}"
             )
 
-    for record in all_snapshot_records(snapshot):
-        if not hasattr(record, "payload"):
-            continue
+    for record in snapshot.records:
         payload = record.payload
         if not hasattr(payload, "styles"):
             continue
@@ -279,8 +365,9 @@ def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
         if len(set(hyperlink_ids)) != len(hyperlink_ids):
             raise ValueError("PAGE contains a duplicate hyperlink ID")
 
+    # Every record, including unknown ones, is framed and checksummed.
     offset = SNAPSHOT_ENVELOPE_SIZE
-    for record in all_snapshot_records(snapshot):
+    for record in snapshot.records:
         offset = validate_record(record, data, offset)
 
     if offset != len(data):

@@ -15,28 +15,23 @@ doc: |
   this schema. Each SCREEN declares its complete logical history extent before
   READY.
 
-  Record CRC32C values are represented here but cannot be calculated by
-  portable Kaitai Struct expressions. The adjacent verify-kaitai.py script
-  validates those values after parsing.
+  A decoder skips every record whose tag it does not know, wherever it
+  appears, after checking its length and CRC32C. This lets newer encoders
+  add optional kinds of records without changing the format version.
+
+  Because unknown records can appear between any two records, this schema
+  parses a snapshot as a flat list of records ending at FINISH. Each record
+  with a known tag gets its typed payload, and any other record keeps its
+  payload as raw bytes. The adjacent verify-kaitai.py script checks what
+  portable Kaitai expressions cannot: the order of the records, the
+  declared counts, the screen keys, and every record's CRC32C.
 seq:
   - id: envelope
     type: envelope
-  - id: terminal
-    type: terminal_record
-  - id: screens
-    type: screen_sequence
-    repeat: expr
-    repeat-expr: terminal.payload.header.screen_count
-  - id: continuation
-    type: continuation_record
-  - id: ready
-    type: checkpoint_record(5)
-  - id: histories
-    type: history_sequence
-    repeat: expr
-    repeat-expr: terminal.payload.header.screen_count
-  - id: finish
-    type: checkpoint_record(6)
+  - id: records
+    type: record
+    repeat: until
+    repeat-until: _.header.tag == 6
 enums:
   record_tag:
     1: terminal
@@ -174,6 +169,37 @@ types:
       - id: crc32c
         type: u4
 
+  record:
+    doc: |
+      Any record. The payload type follows the tag. READY, FINISH and
+      CONTINUATION payloads are raw bytes, and so is the payload of any
+      record with an unknown tag. Decoders skip those unknown records.
+    seq:
+      - id: header
+        type: record_header_any
+      - id: payload
+        size: header.payload_length
+        type:
+          switch-on: header.tag
+          cases:
+            1: terminal_payload
+            2: screen_payload
+            3: page_payload
+            4: history_payload
+
+  record_header_any:
+    doc: |
+      The same framing as record_header, but accepting any tag, including
+      unknown ones. record_header requires one expected tag and is used to
+      parse a single record of a known kind.
+    seq:
+      - id: tag
+        type: u2
+      - id: payload_length
+        type: u4
+      - id: crc32c
+        type: u4
+
   terminal_record:
     seq:
       - id: header
@@ -228,26 +254,6 @@ types:
         size: header.payload_length
         valid:
           expr: _.size == 0
-
-  screen_sequence:
-    doc: SCREEN followed by its declared PAGE records, oldest-to-newest.
-    seq:
-      - id: screen
-        type: screen_record
-      - id: pages
-        type: page_record
-        repeat: expr
-        repeat-expr: screen.payload.header.page_count
-
-  history_sequence:
-    doc: HISTORY followed by its declared PAGE records, newest-to-oldest.
-    seq:
-      - id: history
-        type: history_record
-      - id: pages
-        type: page_record
-        repeat: expr
-        repeat-expr: history.payload.page_count
 
   terminal_payload:
     seq:

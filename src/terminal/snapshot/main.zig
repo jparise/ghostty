@@ -62,6 +62,13 @@
 //! +----------------------------------------+
 //! ```
 //!
+//! A decoder skips any record whose tag it does not know, wherever it
+//! appears, after checking its length and CRC32C. This lets newer encoders
+//! add optional kinds of records that older decoders ignore, without
+//! changing the snapshot version. The version only changes when the layout
+//! of an existing record changes, or when a new kind of record is needed for
+//! the terminal to be correct. See "Unknown Records" in `record.zig`.
+//!
 //! The SCREEN and HISTORY sequence groups may each appear in any key order.
 //! Each key must occur exactly once in each group and must identify one of the
 //! screens declared by TERMINAL. SCREEN contains the complete pages needed to
