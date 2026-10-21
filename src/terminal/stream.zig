@@ -652,26 +652,52 @@ pub fn Stream(comptime H: type) type {
             if (self.continuation != null) self.trackContinuation(input);
         }
 
-        /// Process input, stopping after the first byte that reaches any
-        /// boundary in `boundaries`. Null when the whole input was consumed
-        /// without reaching one. Handler actions run for the consumed prefix
-        /// only. The bytes consumed across any sequence of calls are exactly
-        /// the bytes the stream parsed, in order, and a second Stream fed
-        /// those bytes is in the same parser state at every reported boundary.
+        /// Process input until the first byte that reaches one of
+        /// `boundaries`, and stop right after that byte.
         ///
-        /// `.ground` is a state rather than a transition: if the stream is
-        /// already at ground this consumes nothing and reports a stop with
-        /// consumed = 0. Callers that loop must then feed the next bytes
-        /// without `.ground` in the set (or with `nextSlice`) to make
-        /// progress. Requesting ground costs 1% to 5% over `nextSlice`
-        /// because the stream must return at ground instead of staying in
-        /// the bulk loop. Requesting only string boundaries costs nothing
-        /// per byte: the checks sit at the handful of places that already
-        /// dispatch a string start or end, once per sequence.
+        /// Returns the stop, or null if the whole input was consumed
+        /// without reaching a boundary. Only the consumed bytes are
+        /// processed, so handler actions never run for bytes after the
+        /// stop. Feed the rest of the input in a later call.
         ///
-        /// Every check is behind the comptime `until` flag threaded through
-        /// the parsing functions, so `nextSlice` compiles to the same code
-        /// whether or not this is ever used.
+        /// The bytes consumed across a series of calls are exactly the
+        /// bytes the stream parsed, in order. A second stream fed those
+        /// same bytes is in the same parser state at every stop. That makes
+        /// this useful for proxies that forward terminal output: they can
+        /// find exactly where an APC string starts and ends, or wait for
+        /// ground before inserting their own sequences.
+        ///
+        /// `.ground` is a state, not an event. If the stream is already at
+        /// ground, this consumes nothing and returns a stop with
+        /// `consumed == 0`. A loop that keeps asking for `.ground` with the
+        /// same input never makes progress. After a ground stop, feed the
+        /// next bytes without `.ground` in the set, or with `nextSlice`.
+        ///
+        /// This loop collects the content of every APC string in `input`:
+        ///
+        /// ```zig
+        /// const set: Boundary.Set = .initMany(&.{ .apc_start, .apc_end });
+        /// var rest = input;
+        /// var content_start: ?usize = null;
+        /// while (stream.nextSliceUntil(rest, set)) |stop| {
+        ///     const offset = input.len - rest.len;
+        ///     if (stop.start != null) content_start = offset + stop.consumed;
+        ///     if (stop.end != null) {
+        ///         // The ending byte is consumed but is not content.
+        ///         const content_end = offset + stop.consumed - 1;
+        ///         handleApc(input[content_start.?..content_end]);
+        ///     }
+        ///     rest = rest[stop.consumed..];
+        /// }
+        /// ```
+        ///
+        /// Asking for `.ground` costs 1% to 5% over `nextSlice`, because the
+        /// stream has to leave its fast path at every return to ground.
+        /// Asking only for string boundaries adds no cost per byte. The
+        /// checks run once per string, in code that already handles the
+        /// string's start and end. Every check is compiled out of
+        /// `nextSlice`, so its code is unchanged whether or not this
+        /// function is used.
         pub inline fn nextSliceUntil(
             self: *Self,
             input: []const u8,
@@ -3228,86 +3254,99 @@ pub fn Stream(comptime H: type) type {
     };
 }
 
-/// A point in the byte stream at which `Stream.nextSliceUntil` can stop.
+/// A point in the byte stream where `Stream.nextSliceUntil` can stop.
 ///
-/// The stream reaches a boundary on exactly one byte and reports it
-/// through `Stop` without parsing that byte twice, so an embedder can
-/// learn a sequence's extent from the same parse that handled it.
+/// Each boundary is reached by exactly one byte. The stream stops right
+/// after that byte and reports it in a `Stop`, so you learn where a
+/// sequence starts or ends from the same parse that handles it, without
+/// parsing any byte twice.
 pub const Boundary = enum {
-    /// Not inside any sequence or UTF-8 codepoint. A state, not a
-    /// transition: when already at ground the call consumes nothing
-    /// and reports a stop with consumed = 0.
+    /// The stream is not inside any escape sequence or partial UTF-8
+    /// character. This is a state, not an event. If the stream is already
+    /// at ground when you ask for it, the call stops immediately and
+    /// consumes nothing.
     ground,
 
-    /// The byte that entered the APC string state. Also SOS and PM:
-    /// the table has one state for all three and the terminal feeds
-    /// all three to its APC handler.
+    /// The byte that started an APC string. SOS and PM strings report
+    /// this too, because the parser handles all three the same way.
+    /// Use `Stop.Start.byte` to tell them apart.
     apc_start,
 
-    /// The byte that left the APC string state.
+    /// The byte that ended an APC, SOS or PM string.
     apc_end,
 
-    // Reserved, not done: dcs_start, dcs_end, osc_start, osc_end.
+    // Reserved for later: dcs_start, dcs_end, osc_start, osc_end.
 
-    /// A set of Boundary values so an embedder can subscribe to multiple.
+    /// A set of boundaries to stop at.
     pub const Set = std.EnumSet(Boundary);
-    pub const StringKind = enum(u8) { apc, dcs, osc };
 
-    pub const Introducer = enum(u8) {
-        /// ESC then the final ('_', 'X', '^'). consumed covers only
-        /// the final; the ESC may have been consumed by an earlier call.
-        esc,
+    /// The kind of control string that started or ended. Only `apc` is
+    /// reported today. `dcs` and `osc` are reserved for future boundaries.
+    pub const StringKind = lib.Enum(lib.target, &.{ "apc", "dcs", "osc" });
 
-        /// One C1 byte (0x9F, 0x98, 0x9E).
-        c1,
-    };
+    /// How a control string started.
+    ///
+    /// - `esc`: ESC followed by `_` (APC), `X` (SOS) or `^` (PM). The
+    ///   stop's `consumed` count includes only the final byte, because the
+    ///   ESC may have been consumed by an earlier call.
+    /// - `c1`: a single 8-bit byte, 0x9F (APC), 0x98 (SOS) or 0x9E (PM).
+    ///   At ground these bytes are decoded as UTF-8 instead, so they only
+    ///   start a string when they arrive inside another escape sequence.
+    pub const Introducer = lib.Enum(lib.target, &.{ "esc", "c1" });
 
-    pub const EndReason = enum(u8) {
-        /// ESC. The next byte is not consumed; it is dispatched as an
-        /// ordinary escape on the next call.
-        st_esc,
+    /// How a control string ended.
+    ///
+    /// - `st_esc`: ESC, the first byte of the string terminator `ESC \`.
+    ///   The ESC is consumed but the byte after it is not. That byte is
+    ///   handled as a normal escape sequence by the next call.
+    /// - `st_c1`: 0x9C, the 8-bit string terminator.
+    /// - `cancelled`: CAN (0x18) or SUB (0x1A).
+    /// - `aborted`: any other 8-bit control byte. It either runs as a
+    ///   control or starts a new CSI, DCS or OSC sequence.
+    ///
+    /// `st_esc` and `st_c1` are proper terminators. `cancelled` and
+    /// `aborted` cut the string short.
+    pub const EndReason = lib.Enum(lib.target, &.{
+        "st_esc",
+        "st_c1",
+        "cancelled",
+        "aborted",
+    });
 
-        /// 0x9C.
-        st_c1,
-
-        /// CAN or SUB.
-        cancelled,
-
-        /// Another C1 byte: execute, or switch to CSI/DCS/OSC.
-        aborted,
-
-        /// True when the string ended with a string terminator. This
-        /// is the same flag the stream hands the handler's `apc_end`.
-        pub fn terminated(self: EndReason) bool {
-            return switch (self) {
-                .st_esc, .st_c1 => true,
-                .cancelled, .aborted => false,
-            };
-        }
-    };
-
+    /// Where `Stream.nextSliceUntil` stopped and why.
     pub const Stop = struct {
-        /// Includes the byte that reached the boundary.
+        /// The number of input bytes consumed, including the byte that
+        /// reached the boundary. This is 0 when the stream was already at
+        /// ground and `.ground` was requested.
         consumed: usize,
 
-        /// Every requested boundary that byte reached. Two bits when a
-        /// string end also reaches ground (CAN, SUB, 0x9C). A C1 string
-        /// introducer inside a string (0x98, 0x9E, 0x9F) is a no-op
-        /// self-transition in the parser, so it never reports an end
-        /// and a start together.
+        /// Every requested boundary that the stopping byte reached.
+        ///
+        /// This can hold two values. CAN, SUB, 0x9C and other 8-bit
+        /// controls end a string and return to ground in a single byte,
+        /// so an `apc_end` stop also includes `ground` if you asked for
+        /// it. `apc_start` and `apc_end` never appear together.
         reached: Set,
+
+        /// Set when `reached` contains `apc_start`.
         start: ?Start = null,
+
+        /// Set when `reached` contains `apc_end`.
         end: ?End = null,
 
         pub const Start = struct {
             kind: StringKind,
             introducer: Introducer,
+
+            /// The byte that started the string, such as `_` or 0x9F.
             byte: u8,
         };
 
         pub const End = struct {
             kind: StringKind,
             reason: EndReason,
+
+            /// The byte that ended the string, such as ESC or 0x9C.
             byte: u8,
         };
     };
@@ -5568,7 +5607,11 @@ fn testApcExits(comptime H: type) !void {
             try testing.expectEqual(reason, end.reason);
             try testing.expectEqual(c, end.byte);
             try testing.expectEqual(@as(usize, 1), h.ended);
-            try testing.expectEqual(reason.terminated(), h.last_terminated.?);
+            const terminated = switch (reason) {
+                .st_esc, .st_c1 => true,
+                .cancelled, .aborted => false,
+            };
+            try testing.expectEqual(terminated, h.last_terminated.?);
         } else {
             try testing.expectEqual(@as(?Boundary.Stop, null), stop_);
             try testing.expectEqual(@as(usize, 0), h.ended);
