@@ -661,11 +661,12 @@ pub fn Stream(comptime H: type) type {
         /// stop. Feed the rest of the input in a later call.
         ///
         /// The bytes consumed across a series of calls are exactly the
-        /// bytes the stream parsed, in order. A second stream fed those
-        /// same bytes is in the same parser state at every stop. That makes
-        /// this useful for proxies that forward terminal output: they can
-        /// find exactly where an APC string starts and ends, or wait for
-        /// ground before inserting their own sequences.
+        /// bytes the stream parsed, in order, and a second stream fed those
+        /// same bytes is in the same parser state at every stop. This is
+        /// what a proxy that sits between a program and a terminal needs.
+        /// It can find exactly where a control string starts and ends, or
+        /// wait for a safe point before inserting its own output, using
+        /// the same parse that drives its terminal.
         ///
         /// `.ground` is a state, not an event. If the stream is already at
         /// ground, this consumes nothing and returns a stop with
@@ -673,7 +674,9 @@ pub fn Stream(comptime H: type) type {
         /// same input never makes progress. After a ground stop, feed the
         /// next bytes without `.ground` in the set, or with `nextSlice`.
         ///
-        /// This loop collects the content of every APC string in `input`:
+        /// This loop finds the content of every APC string in `input`.
+        /// DCS and OSC strings work the same way with their own
+        /// boundaries:
         ///
         /// ```zig
         /// const set: Boundary.Set = .initMany(&.{ .apc_start, .apc_end });
@@ -691,12 +694,16 @@ pub fn Stream(comptime H: type) type {
         /// }
         /// ```
         ///
+        /// The loop needs no special case for a string that ends with the
+        /// two-byte terminator `ESC \`. The stop lands on the ESC, and the
+        /// backslash is just the next byte of `rest`.
+        ///
         /// Asking for `.ground` costs 1% to 5% over `nextSlice`, because the
         /// stream has to leave its fast path at every return to ground.
-        /// Asking only for string boundaries adds no cost per byte. The
-        /// checks run once per string, in code that already handles the
-        /// string's start and end. Every check is compiled out of
-        /// `nextSlice`, so its code is unchanged whether or not this
+        /// Asking only for string boundaries costs nothing on the bulk
+        /// paths that handle text and string payloads, and a little for
+        /// each byte of an escape sequence. Every check is compiled out
+        /// of `nextSlice`, so its code is unchanged whether or not this
         /// function is used.
         pub inline fn nextSliceUntil(
             self: *Self,
@@ -973,7 +980,7 @@ pub fn Stream(comptime H: type) type {
                                 self.parser.state = .escape;
                                 self.handler.vt(.apc_end, .{ .terminated = true });
                                 if (comptime until) {
-                                    u.apcEnd(input[offset]);
+                                    u.stringEnd(.apc, input[offset]);
                                     offset += 1;
                                     if (self.untilReached(u, input.ptr + offset)) return offset;
                                     continue;
@@ -985,7 +992,7 @@ pub fn Stream(comptime H: type) type {
                                 self.parser.state = .ground;
                                 self.handler.vt(.apc_end, .{ .terminated = true });
                                 if (comptime until) {
-                                    u.apcEnd(input[offset]);
+                                    u.stringEnd(.apc, input[offset]);
                                     offset += 1;
                                     if (self.untilReached(u, input.ptr + offset)) return offset;
                                     continue;
@@ -1023,6 +1030,12 @@ pub fn Stream(comptime H: type) type {
                                 )) |cmd| self.oscDispatch(cmd.*);
                                 self.parser.clear();
                                 self.parser.state = .escape;
+                                if (comptime until) {
+                                    u.stringEnd(.osc, input[offset]);
+                                    offset += 1;
+                                    if (self.untilReached(u, input.ptr + offset)) return offset;
+                                    continue;
+                                }
                                 offset += 1;
                                 continue;
                             },
@@ -1032,6 +1045,12 @@ pub fn Stream(comptime H: type) type {
                                     std.ascii.control_code.bel,
                                 )) |cmd| self.oscDispatch(cmd.*);
                                 self.parser.state = .ground;
+                                if (comptime until) {
+                                    u.stringEnd(.osc, input[offset]);
+                                    offset += 1;
+                                    if (self.untilReached(u, input.ptr + offset)) return offset;
+                                    continue;
+                                }
                                 offset += 1;
                                 continue;
                             },
@@ -1404,6 +1423,13 @@ pub fn Stream(comptime H: type) type {
                 }
             }
 
+            // String boundaries are parser state transitions, not
+            // handler actions: an OSC or DCS can start and end without
+            // producing one, and a vtRaw handler can skip any action.
+            // So in until mode they are found by comparing the parser
+            // state before and after the byte.
+            const prev_state = if (comptime until) self.parser.state else {};
+
             // We explicitly inline this call here for performance reasons.
             //
             // We do this rather than mark Parser.next as inline because doing
@@ -1411,19 +1437,11 @@ pub fn Stream(comptime H: type) type {
             // miscompile or it's just very counter-intuitive comptime stuff,
             // but regardless, this is the easy solution.
             const actions = @call(.always_inline, Parser.next, .{ &self.parser, c });
+            if (comptime until) u.transition(prev_state, self.parser.state, c);
 
             for (actions) |action_opt| {
                 const action = action_opt orelse continue;
                 if (comptime debug) log.info("action: {f}", .{action});
-
-                // String boundaries are parser state transitions, so
-                // they are noted before a handler gets to skip the
-                // action through vtRaw.
-                if (comptime until) switch (action) {
-                    .apc_start => u.apcStart(c),
-                    .apc_end => u.apcEnd(c),
-                    else => {},
-                };
 
                 // A handler can expose this to get the raw action before
                 // it is further parsed. If this returns `true` then we skip
@@ -3257,60 +3275,103 @@ pub fn Stream(comptime H: type) type {
 /// A point in the byte stream where `Stream.nextSliceUntil` can stop.
 ///
 /// Each boundary is reached by exactly one byte. The stream stops right
-/// after that byte and reports it in a `Stop`, so you learn where a
-/// sequence starts or ends from the same parse that handles it, without
+/// after that byte and describes it in a `Stop`, so you learn where a
+/// string starts or ends from the same parse that handles it, without
 /// parsing any byte twice.
+///
+/// Most boundaries mark the first or last byte of a control string: an
+/// APC, DCS or OSC sequence, made of an introducer, some content, and a
+/// terminator. `ground` is different. It marks the state between
+/// sequences rather than a byte inside one.
+///
+/// Terminal protocols spell control bytes two ways, and both are
+/// recognized here. A 7-bit introducer is ESC followed by one byte, such
+/// as `ESC ]` for OSC. The 8-bit form is a single byte in the range 0x80
+/// to 0x9F, such as 0x9D for OSC. The string terminator ST is `ESC \` or
+/// the single byte 0x9C.
 pub const Boundary = enum {
     /// The stream is not inside any escape sequence or partial UTF-8
-    /// character. This is a state, not an event. If the stream is already
-    /// at ground when you ask for it, the call stops immediately and
+    /// character. This is a safe point to insert your own sequences.
+    ///
+    /// Ground is a state, not an event. If the stream is already at
+    /// ground when you ask for it, the call stops immediately and
     /// consumes nothing.
     ground,
 
-    /// The byte that started an APC string. SOS and PM strings report
-    /// this too, because the parser handles all three the same way.
-    /// Use `Stop.Start.byte` to tell them apart.
+    /// The byte that started an APC string: `_` after ESC, or 0x9F.
+    ///
+    /// SOS (`X` or 0x98) and PM (`^` or 0x9E) strings report this too,
+    /// because the parser handles all three the same way. Use
+    /// `Stop.Start.byte` to tell them apart.
     apc_start,
 
     /// The byte that ended an APC, SOS or PM string.
     apc_end,
 
-    // Reserved for later: dcs_start, dcs_end, osc_start, osc_end.
+    /// The byte that started a DCS string: `P` after ESC, or 0x90.
+    ///
+    /// A DCS has a header before its payload: parameters, intermediates
+    /// and a final byte, in the same shape as a CSI sequence. The stop
+    /// lands on the introducer, so the header follows it. The handler's
+    /// `dcs_hook` action still marks where the payload begins. A 0x90
+    /// inside the header restarts the header without leaving the
+    /// string, so it does not stop.
+    dcs_start,
+
+    /// The byte that ended a DCS string, whether it was still in its
+    /// header or already in its payload. A DCS cut short in its header
+    /// reports this without the handler ever seeing a `dcs_hook`.
+    dcs_end,
+
+    /// The byte that started an OSC string: `]` after ESC, or 0x9D.
+    osc_start,
+
+    /// The byte that ended an OSC string. This is reported for every
+    /// OSC, including ones with a number the handler does not know.
+    osc_end,
 
     /// A set of boundaries to stop at.
     pub const Set = std.EnumSet(Boundary);
 
-    /// The kind of control string that started or ended. Only `apc` is
-    /// reported today. `dcs` and `osc` are reserved for future boundaries.
+    /// The kind of control string that started or ended. `apc` covers
+    /// SOS and PM too, see `apc_start`.
     pub const StringKind = lib.Enum(lib.target, &.{ "apc", "dcs", "osc" });
 
     /// How a control string started.
     ///
-    /// - `esc`: ESC followed by `_` (APC), `X` (SOS) or `^` (PM). The
-    ///   stop's `consumed` count includes only the final byte, because the
-    ///   ESC may have been consumed by an earlier call.
-    /// - `c1`: a single 8-bit byte, 0x9F (APC), 0x98 (SOS) or 0x9E (PM).
-    ///   At ground these bytes are decoded as UTF-8 instead, so they only
-    ///   start a string when they arrive inside another escape sequence.
+    /// - `esc`: ESC followed by `_` (APC), `X` (SOS), `^` (PM), `P` (DCS)
+    ///   or `]` (OSC). The stop's `consumed` count includes only the final
+    ///   byte, because the ESC may have been consumed by an earlier call.
+    /// - `c1`: a single 8-bit byte, 0x9F (APC), 0x98 (SOS), 0x9E (PM),
+    ///   0x90 (DCS) or 0x9D (OSC). At ground these bytes are decoded as
+    ///   UTF-8 instead, so they only start a string when they arrive
+    ///   inside another escape sequence.
     pub const Introducer = lib.Enum(lib.target, &.{ "esc", "c1" });
 
     /// How a control string ended.
     ///
-    /// - `st_esc`: ESC, the first byte of the string terminator `ESC \`.
-    ///   The ESC is consumed but the byte after it is not. That byte is
-    ///   handled as a normal escape sequence by the next call.
-    /// - `st_c1`: 0x9C, the 8-bit string terminator.
+    /// - `st_esc`: ESC, the first byte of the terminator `ESC \`. The ESC
+    ///   is consumed but the byte after it is not. That byte is handled
+    ///   as a normal escape sequence by the next call.
+    /// - `st_c1`: 0x9C, the 8-bit terminator.
+    /// - `bel`: BEL (0x07). Only an OSC ends this way.
     /// - `cancelled`: CAN (0x18) or SUB (0x1A).
     /// - `aborted`: any other 8-bit control byte. It either runs as a
-    ///   control or starts a new CSI, DCS or OSC sequence.
+    ///   control or starts a new sequence of its own. See `Stop.reached`.
     ///
-    /// `st_esc` and `st_c1` are proper terminators. `cancelled` and
-    /// `aborted` cut the string short.
+    /// `st_esc`, `st_c1` and `bel` are proper terminators. `cancelled`
+    /// and `aborted` cut the string short.
+    ///
+    /// Inside an OSC, and inside a DCS once its header is complete, every
+    /// 8-bit byte is content. Only ESC, CAN, SUB and (for OSC) BEL end
+    /// those strings, so `st_c1` and `aborted` are only ever reported for
+    /// an APC or for a DCS still in its header.
     pub const EndReason = lib.Enum(lib.target, &.{
         "st_esc",
         "st_c1",
         "cancelled",
         "aborted",
+        "bel",
     });
 
     /// Where `Stream.nextSliceUntil` stopped and why.
@@ -3322,23 +3383,43 @@ pub const Boundary = enum {
 
         /// Every requested boundary that the stopping byte reached.
         ///
-        /// This can hold two values. CAN, SUB, 0x9C and other 8-bit
-        /// controls end a string and return to ground in a single byte,
-        /// so an `apc_end` stop also includes `ground` if you asked for
-        /// it. `apc_start` and `apc_end` never appear together.
+        /// This is usually one boundary. It holds two when a single byte
+        /// does two things:
+        ///
+        /// - It ends a string and returns to ground. BEL, CAN, SUB, 0x9C
+        ///   and the other 8-bit controls all do this, so an end stop also
+        ///   includes `ground` when you asked for it.
+        /// - It ends one string and starts another. An 8-bit introducer
+        ///   of a different kind does this inside an APC, or inside a DCS
+        ///   header: 0x90 or 0x9D in an APC ends it and starts a DCS or
+        ///   OSC, and 0x9F, 0x98, 0x9E or 0x9D in a DCS header ends it
+        ///   and starts an APC or OSC. Both `start` and `end` are set and
+        ///   the end's reason is `aborted`.
+        ///
+        /// For example, in `ESC _ a 0x9D 2 ; t BEL` the 0x9D ends the APC
+        /// and starts an OSC. Asking for `.apc_end` and `.osc_start` gives
+        /// one stop on the 0x9D with both in `reached`, and the OSC's
+        /// content `2;t` begins right after it.
+        ///
+        /// The second case never happens inside an OSC, or inside a DCS
+        /// past its header, because 8-bit bytes are content there. It
+        /// also does not happen for 0x98, 0x9E or 0x9F inside an APC,
+        /// which the parser drops without a stop. A start and an end of
+        /// the same kind never coincide.
         reached: Set,
 
-        /// Set when `reached` contains `apc_start`.
+        /// Set when `reached` contains a string start.
         start: ?Start = null,
 
-        /// Set when `reached` contains `apc_end`.
+        /// Set when `reached` contains a string end.
         end: ?End = null,
 
         pub const Start = struct {
             kind: StringKind,
             introducer: Introducer,
 
-            /// The byte that started the string, such as `_` or 0x9F.
+            /// The byte that started the string, such as `_`, `P`, `]`
+            /// or 0x9F.
             byte: u8,
         };
 
@@ -3346,7 +3427,7 @@ pub const Boundary = enum {
             kind: StringKind,
             reason: EndReason,
 
-            /// The byte that ended the string, such as ESC or 0x9C.
+            /// The byte that ended the string, such as ESC, BEL or 0x9C.
             byte: u8,
         };
     };
@@ -3369,26 +3450,76 @@ const Until = struct {
     /// The stop being built. Null until a byte reaches a boundary.
     stop: ?Boundary.Stop = null,
 
-    /// Note that `c` entered the APC string state.
-    fn apcStart(self: *Until, c: u8) void {
-        if (!self.boundaries.contains(.apc_start)) return;
+    /// The string kind a parser state belongs to, or null for a state
+    /// that is not inside a control string. The DCS states form one
+    /// family: a string starts when the parser enters a family from
+    /// outside it and ends when the parser leaves it, so moving
+    /// between the DCS header and payload states is not a boundary.
+    fn family(state: Parser.State) ?Boundary.StringKind {
+        return switch (state) {
+            .sos_pm_apc_string => .apc,
+            .dcs_entry,
+            .dcs_param,
+            .dcs_intermediate,
+            .dcs_passthrough,
+            .dcs_ignore,
+            => .dcs,
+            .osc_string => .osc,
+            else => null,
+        };
+    }
+
+    /// Note that `c` moved the parser from state `old` to state `new`,
+    /// and record a string end, a string start, or both, if that
+    /// transition left or entered a string family.
+    fn transition(
+        self: *Until,
+        old: Parser.State,
+        new: Parser.State,
+        c: u8,
+    ) void {
+        if (old == new) return;
+        const from = family(old);
+        const to = family(new);
+        if (from) |kind| {
+            if (to == null or to.? != kind) self.stringEnd(kind, c);
+        }
+        if (to) |kind| {
+            if (from == null or from.? != kind) self.stringStart(kind, c);
+        }
+    }
+
+    /// Note that `c` entered a string of the given kind.
+    fn stringStart(self: *Until, kind: Boundary.StringKind, c: u8) void {
+        const boundary: Boundary = switch (kind) {
+            .apc => .apc_start,
+            .dcs => .dcs_start,
+            .osc => .osc_start,
+        };
+        if (!self.boundaries.contains(boundary)) return;
         const stop = self.stopPtr();
-        stop.reached.insert(.apc_start);
+        stop.reached.insert(boundary);
         stop.start = .{
-            .kind = .apc,
+            .kind = kind,
             .introducer = if (c >= 0x80) .c1 else .esc,
             .byte = c,
         };
     }
 
-    /// Note that `c` left the APC string state.
-    fn apcEnd(self: *Until, c: u8) void {
-        if (!self.boundaries.contains(.apc_end)) return;
+    /// Note that `c` left a string of the given kind.
+    fn stringEnd(self: *Until, kind: Boundary.StringKind, c: u8) void {
+        const boundary: Boundary = switch (kind) {
+            .apc => .apc_end,
+            .dcs => .dcs_end,
+            .osc => .osc_end,
+        };
+        if (!self.boundaries.contains(boundary)) return;
         const stop = self.stopPtr();
-        stop.reached.insert(.apc_end);
+        stop.reached.insert(boundary);
         stop.end = .{
-            .kind = .apc,
+            .kind = kind,
             .reason = switch (c) {
+                0x07 => .bel,
                 0x18, 0x1A => .cancelled,
                 0x1B => .st_esc,
                 0x9C => .st_c1,
@@ -5485,7 +5616,8 @@ test "stream: nextSliceUntil ground tracks only the consumed prefix" {
 }
 
 /// A test handler for boundary stops: records APC lifecycle, content,
-/// and how many codepoints were printed.
+/// how many codepoints were printed, and the DCS and OSC actions that
+/// a string of those kinds produces.
 const BoundaryTestHandler = struct {
     started: usize = 0,
     ended: usize = 0,
@@ -5493,6 +5625,10 @@ const BoundaryTestHandler = struct {
     buf: [512]u8 = undefined,
     len: usize = 0,
     prints: usize = 0,
+    dcs_hooks: usize = 0,
+    dcs_unhooks: usize = 0,
+    titles: usize = 0,
+    clipboards: usize = 0,
 
     pub fn deinit(_: *@This()) void {}
 
@@ -5517,6 +5653,10 @@ const BoundaryTestHandler = struct {
             },
             .print => self.prints += 1,
             .print_slice => self.prints += value.cps.len,
+            .dcs_hook => self.dcs_hooks += 1,
+            .dcs_unhook => self.dcs_unhooks += 1,
+            .window_title => self.titles += 1,
+            .clipboard_contents => self.clipboards += 1,
             else => {},
         }
     }
@@ -5553,15 +5693,24 @@ fn boundaryHandler(stream: anytype) *BoundaryTestHandler {
 const apc_end_set: Boundary.Set = .initOne(.apc_end);
 const apc_start_set: Boundary.Set = .initOne(.apc_start);
 const apc_set: Boundary.Set = .initMany(&.{ .apc_start, .apc_end });
-const all_set: Boundary.Set = .initMany(&.{ .ground, .apc_start, .apc_end });
+const dcs_end_set: Boundary.Set = .initOne(.dcs_end);
+const osc_end_set: Boundary.Set = .initOne(.osc_end);
+const dcs_set: Boundary.Set = .initMany(&.{ .dcs_start, .dcs_end });
+const osc_set: Boundary.Set = .initMany(&.{ .osc_start, .osc_end });
+/// Every string boundary, without ground.
+const strings_set: Boundary.Set = apc_set.unionWith(dcs_set).unionWith(osc_set);
+/// Every boundary.
+const all_set: Boundary.Set = strings_set.unionWith(.initOne(.ground));
 
-/// Expected result of feeding one byte to a stream inside an APC.
-const ApcExit = struct {
+/// Expected result of feeding one byte to a stream inside an APC or an
+/// OSC: the end reason if the byte ends the string, and the parser state
+/// after it.
+const StringExit = struct {
     reason: ?Boundary.EndReason,
     state: Parser.State,
 };
 
-fn expectedApcExit(c: u8) ApcExit {
+fn expectedApcExit(c: u8) StringExit {
     return switch (c) {
         0x18, 0x1A => .{ .reason = .cancelled, .state = .ground },
         0x1B => .{ .reason = .st_esc, .state = .escape },
@@ -5608,7 +5757,7 @@ fn testApcExits(comptime H: type) !void {
             try testing.expectEqual(c, end.byte);
             try testing.expectEqual(@as(usize, 1), h.ended);
             const terminated = switch (reason) {
-                .st_esc, .st_c1 => true,
+                .st_esc, .st_c1, .bel => true,
                 .cancelled, .aborted => false,
             };
             try testing.expectEqual(terminated, h.last_terminated.?);
@@ -5898,6 +6047,487 @@ test "stream: nextSliceUntil apc start with ground requested" {
     try testing.expect(ground.reached.eql(.initOne(.ground)));
 }
 
+/// Expected result of feeding one byte to a stream inside an OSC.
+fn expectedOscExit(c: u8) StringExit {
+    return switch (c) {
+        0x07 => .{ .reason = .bel, .state = .ground },
+        0x18, 0x1A => .{ .reason = .cancelled, .state = .ground },
+        0x1B => .{ .reason = .st_esc, .state = .escape },
+        // Every byte from 0x20 up is data, including 0x9C, 0x9D, 0x9F
+        // and 0xA0 to 0xFF. The remaining C0 bytes are ignored.
+        else => .{ .reason = null, .state = .osc_string },
+    };
+}
+
+fn testOscExits(comptime H: type) !void {
+    const S = Stream(H);
+    var c: u8 = 0;
+    while (true) : (c += 1) {
+        const expected = expectedOscExit(c);
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        s.nextSlice("\x1b]2;ab");
+        try testing.expectEqual(Parser.State.osc_string, s.parser.state);
+        const h = boundaryHandler(&s);
+
+        const input = [_]u8{c};
+        const stop_ = s.nextSliceUntil(&input, osc_end_set);
+        try testing.expectEqual(expected.state, s.parser.state);
+
+        if (expected.reason) |reason| {
+            const stop = stop_ orelse return error.ExpectedStop;
+            try testing.expectEqual(@as(usize, 1), stop.consumed);
+            try testing.expect(stop.reached.eql(osc_end_set));
+            try testing.expect(stop.start == null);
+            const end = stop.end orelse return error.ExpectedEnd;
+            try testing.expectEqual(Boundary.StringKind.osc, end.kind);
+            try testing.expectEqual(reason, end.reason);
+            try testing.expectEqual(c, end.byte);
+            // A proper terminator dispatches the title.
+            if (reason == .bel or reason == .st_esc) {
+                try testing.expectEqual(@as(usize, 1), h.titles);
+            }
+        } else {
+            try testing.expectEqual(@as(?Boundary.Stop, null), stop_);
+            try testing.expectEqual(@as(usize, 0), h.titles);
+        }
+
+        if (c == 0xFF) break;
+    }
+}
+
+test "stream: nextSliceUntil every osc exit" {
+    try testOscExits(BoundaryTestHandler);
+}
+
+test "stream: nextSliceUntil every osc exit through the scalar path" {
+    try testOscExits(BoundaryRawTestHandler);
+}
+
+test "stream: nextSliceUntil osc end without a dispatch" {
+    // An OSC with a number the terminal doesn't know never reaches
+    // the handler, but it still ends.
+    inline for (.{ BoundaryTestHandler, BoundaryRawTestHandler }) |H| {
+        var s: Stream(H) = .init(.{ .handler = .{} });
+        defer s.deinit();
+        const stop = s.nextSliceUntil("\x1b]9999;ab\x07x", osc_end_set).?;
+        try testing.expectEqual(@as(usize, 10), stop.consumed);
+        try testing.expect(stop.reached.eql(osc_end_set));
+        try testing.expectEqual(Boundary.StringKind.osc, stop.end.?.kind);
+        try testing.expectEqual(Boundary.EndReason.bel, stop.end.?.reason);
+        try testing.expect(s.ground());
+        try testing.expectEqual(@as(usize, 0), boundaryHandler(&s).titles);
+        try testing.expectEqual(@as(usize, 0), boundaryHandler(&s).prints);
+    }
+}
+
+test "stream: nextSliceUntil osc st_esc leaves the next byte for the next call" {
+    inline for (.{ BoundaryTestHandler, BoundaryRawTestHandler }) |H| {
+        // ESC then backslash: the proper terminator.
+        {
+            var s: Stream(H) = .init(.{ .handler = .{} });
+            defer s.deinit();
+            s.nextSlice("\x1b]2;ab");
+            const stop = s.nextSliceUntil("\x1b\\x", osc_end_set).?;
+            try testing.expectEqual(@as(usize, 1), stop.consumed);
+            try testing.expectEqual(Boundary.EndReason.st_esc, stop.end.?.reason);
+            try testing.expectEqual(Parser.State.escape, s.parser.state);
+            try testing.expectEqual(@as(?Boundary.Stop, null), s.nextSliceUntil("\\x", osc_end_set));
+            try testing.expect(s.ground());
+            try testing.expectEqual(@as(usize, 1), boundaryHandler(&s).titles);
+            try testing.expectEqual(@as(usize, 1), boundaryHandler(&s).prints);
+        }
+
+        // ESC then another byte: the string still ended at the ESC and
+        // the next byte starts its own sequence.
+        {
+            var s: Stream(H) = .init(.{ .handler = .{} });
+            defer s.deinit();
+            s.nextSlice("\x1b]2;ab");
+            const stop = s.nextSliceUntil("\x1b[1mx", osc_end_set).?;
+            try testing.expectEqual(@as(usize, 1), stop.consumed);
+            try testing.expectEqual(Boundary.EndReason.st_esc, stop.end.?.reason);
+            try testing.expectEqual(@as(?Boundary.Stop, null), s.nextSliceUntil("[1mx", osc_end_set));
+            try testing.expect(s.ground());
+            try testing.expectEqual(@as(usize, 1), boundaryHandler(&s).titles);
+            try testing.expectEqual(@as(usize, 1), boundaryHandler(&s).prints);
+        }
+    }
+}
+
+/// Expected result of feeding one byte to a stream inside a DCS. A null
+/// state means the byte stays inside the DCS family; which state it
+/// lands in is the parse table's business.
+const DcsExit = struct {
+    reason: ?Boundary.EndReason,
+    state: ?Parser.State,
+};
+
+/// The inputs that put the parser in each DCS state.
+const dcs_entries = [_]struct { input: []const u8, state: Parser.State }{
+    .{ .input = "\x1bP", .state = .dcs_entry },
+    .{ .input = "\x1bP1", .state = .dcs_param },
+    .{ .input = "\x1bP ", .state = .dcs_intermediate },
+    .{ .input = "\x1bP1q", .state = .dcs_passthrough },
+    .{ .input = "\x1bP:", .state = .dcs_ignore },
+};
+
+fn expectedDcsExit(state: Parser.State, c: u8) DcsExit {
+    // In the header the 8-bit controls take their usual transitions.
+    // In the payload (passthrough and ignore) they are data.
+    const header = switch (state) {
+        .dcs_entry, .dcs_param, .dcs_intermediate => true,
+        else => false,
+    };
+    const data: DcsExit = .{ .reason = null, .state = state };
+    return switch (c) {
+        0x18, 0x1A => .{ .reason = .cancelled, .state = .ground },
+        0x1B => .{ .reason = .st_esc, .state = .escape },
+        0x9C => if (header) .{ .reason = .st_c1, .state = .ground } else data,
+        0x9B => if (header) .{ .reason = .aborted, .state = .csi_entry } else data,
+        0x9D => if (header) .{ .reason = .aborted, .state = .osc_string } else data,
+        0x98, 0x9E, 0x9F => if (header) .{ .reason = .aborted, .state = .sos_pm_apc_string } else data,
+        // 0x90 restarts the header without leaving the string.
+        0x90 => if (header) .{ .reason = null, .state = .dcs_entry } else data,
+        0x80...0x8F, 0x91...0x97, 0x99, 0x9A => if (header) .{ .reason = .aborted, .state = .ground } else data,
+        // 0x00 to 0x7F move within the family or stay put; 0xA0 to
+        // 0xFF are ignored in the header and data in the payload.
+        else => .{ .reason = null, .state = null },
+    };
+}
+
+fn testDcsExits(comptime H: type) !void {
+    const S = Stream(H);
+    for (dcs_entries) |entry| {
+        var c: u8 = 0;
+        while (true) : (c += 1) {
+            const expected = expectedDcsExit(entry.state, c);
+            var s: S = .init(.{ .handler = .{} });
+            defer s.deinit();
+            s.nextSlice(entry.input);
+            try testing.expectEqual(entry.state, s.parser.state);
+            const h = boundaryHandler(&s);
+
+            const input = [_]u8{c};
+            const stop_ = s.nextSliceUntil(&input, dcs_end_set);
+            if (expected.state) |state| {
+                try testing.expectEqual(state, s.parser.state);
+            } else {
+                try testing.expectEqual(
+                    @as(?Boundary.StringKind, .dcs),
+                    Until.family(s.parser.state),
+                );
+            }
+
+            if (expected.reason) |reason| {
+                const stop = stop_ orelse return error.ExpectedStop;
+                try testing.expectEqual(@as(usize, 1), stop.consumed);
+                try testing.expect(stop.reached.eql(dcs_end_set));
+                try testing.expect(stop.start == null);
+                const end = stop.end orelse return error.ExpectedEnd;
+                try testing.expectEqual(Boundary.StringKind.dcs, end.kind);
+                try testing.expectEqual(reason, end.reason);
+                try testing.expectEqual(c, end.byte);
+                // Leaving the payload unhooks. Leaving the header never
+                // hooked, so there is nothing to unhook.
+                const hooked: usize = if (entry.state == .dcs_passthrough) 1 else 0;
+                try testing.expectEqual(hooked, h.dcs_hooks);
+                try testing.expectEqual(hooked, h.dcs_unhooks);
+            } else {
+                try testing.expectEqual(@as(?Boundary.Stop, null), stop_);
+                try testing.expectEqual(@as(usize, 0), h.dcs_unhooks);
+            }
+
+            if (c == 0xFF) break;
+        }
+    }
+}
+
+test "stream: nextSliceUntil every dcs exit" {
+    try testDcsExits(BoundaryTestHandler);
+}
+
+test "stream: nextSliceUntil every dcs exit through the scalar path" {
+    try testDcsExits(BoundaryRawTestHandler);
+}
+
+test "stream: nextSliceUntil dcs header restart is not a boundary" {
+    inline for (.{ BoundaryTestHandler, BoundaryRawTestHandler }) |H| {
+        var s: Stream(H) = .init(.{ .handler = .{} });
+        defer s.deinit();
+        const input = "\x1bP1\x902qx\x1b\\";
+        var stops: std.ArrayList(AbsoluteStop) = .empty;
+        defer stops.deinit(testing.allocator);
+        try collectStops(&s, input, 0, dcs_set, &stops);
+        try testing.expectEqual(@as(usize, 2), stops.items.len);
+        try testing.expectEqual(@as(usize, 2), stops.items[0].end);
+        try testing.expect(stops.items[0].reached.eql(.initOne(.dcs_start)));
+        try testing.expectEqual(@as(u8, 'P'), stops.items[0].start.?.byte);
+        try testing.expectEqual(@as(usize, input.len - 1), stops.items[1].end);
+        try testing.expect(stops.items[1].reached.eql(dcs_end_set));
+        try testing.expectEqual(Boundary.EndReason.st_esc, stops.items[1].end_info.?.reason);
+        try testing.expect(s.ground());
+        try testing.expectEqual(@as(usize, 1), boundaryHandler(&s).dcs_hooks);
+        try testing.expectEqual(@as(usize, 1), boundaryHandler(&s).dcs_unhooks);
+    }
+}
+
+test "stream: nextSliceUntil dcs and osc introducers" {
+    const Case = struct {
+        input: []const u8,
+        kind: Boundary.StringKind,
+        introducer: Boundary.Introducer,
+        byte: u8,
+        consumed: usize,
+        state: Parser.State,
+    };
+    const cases = [_]Case{
+        // From ground.
+        .{ .input = "\x1bP1q", .kind = .dcs, .introducer = .esc, .byte = 'P', .consumed = 2, .state = .dcs_entry },
+        .{ .input = "\x1b]2;ab", .kind = .osc, .introducer = .esc, .byte = ']', .consumed = 2, .state = .osc_string },
+        // From inside a CSI, where ESC restarts.
+        .{ .input = "\x1b[1\x1bP1q", .kind = .dcs, .introducer = .esc, .byte = 'P', .consumed = 5, .state = .dcs_entry },
+        .{ .input = "\x1b[1\x1b]2;ab", .kind = .osc, .introducer = .esc, .byte = ']', .consumed = 5, .state = .osc_string },
+        // C1 introducers from inside a CSI. At ground they would be
+        // decoded as UTF-8 and never start a string.
+        .{ .input = "\x1b[1\x901q", .kind = .dcs, .introducer = .c1, .byte = 0x90, .consumed = 4, .state = .dcs_entry },
+        .{ .input = "\x1b[1\x9d2;ab", .kind = .osc, .introducer = .c1, .byte = 0x9D, .consumed = 4, .state = .osc_string },
+    };
+
+    inline for (.{ BoundaryTestHandler, BoundaryRawTestHandler }) |H| {
+        for (cases) |case| {
+            var s: Stream(H) = .init(.{ .handler = .{} });
+            defer s.deinit();
+            const stop = s.nextSliceUntil(case.input, strings_set).?;
+            try testing.expectEqual(case.consumed, stop.consumed);
+            const start_boundary: Boundary = switch (case.kind) {
+                .apc => .apc_start,
+                .dcs => .dcs_start,
+                .osc => .osc_start,
+            };
+            try testing.expect(stop.reached.eql(.initOne(start_boundary)));
+            try testing.expect(stop.end == null);
+            const start = stop.start orelse return error.ExpectedStart;
+            try testing.expectEqual(case.kind, start.kind);
+            try testing.expectEqual(case.introducer, start.introducer);
+            try testing.expectEqual(case.byte, start.byte);
+            try testing.expectEqual(case.state, s.parser.state);
+        }
+    }
+}
+
+/// Handler counts expected after a complete input.
+const ExpectedCounts = struct {
+    started: usize = 0,
+    ended: usize = 0,
+    dcs_hooks: usize = 0,
+    dcs_unhooks: usize = 0,
+    titles: usize = 0,
+    clipboards: usize = 0,
+
+    fn check(self: ExpectedCounts, h: *BoundaryTestHandler) !void {
+        try testing.expectEqual(self.started, h.started);
+        try testing.expectEqual(self.ended, h.ended);
+        try testing.expectEqual(self.dcs_hooks, h.dcs_hooks);
+        try testing.expectEqual(self.dcs_unhooks, h.dcs_unhooks);
+        try testing.expectEqual(self.titles, h.titles);
+        try testing.expectEqual(self.clipboards, h.clipboards);
+    }
+};
+
+/// Feed `input` in one call, collecting the reference stops into
+/// `reference`, then at every split point, and require the same stops
+/// and the same handler counts every time.
+fn testSplits(
+    comptime H: type,
+    input: []const u8,
+    reference: *std.ArrayList(AbsoluteStop),
+    counts: ExpectedCounts,
+) !void {
+    const S = Stream(H);
+    {
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        try collectStops(&s, input, 0, strings_set, reference);
+        try testing.expect(s.ground());
+        try counts.check(boundaryHandler(&s));
+    }
+
+    for (0..input.len + 1) |split| {
+        var stops: std.ArrayList(AbsoluteStop) = .empty;
+        defer stops.deinit(testing.allocator);
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        try collectStops(&s, input[0..split], 0, strings_set, &stops);
+        try collectStops(&s, input[split..], split, strings_set, &stops);
+        try testing.expect(s.ground());
+        try testing.expectEqualDeep(reference.items, stops.items);
+        try counts.check(boundaryHandler(&s));
+    }
+}
+
+test "stream: nextSliceUntil osc stops do not depend on the split" {
+    inline for (.{ BoundaryTestHandler, BoundaryRawTestHandler }) |H| {
+        const input = "\x1b]52;c;QUJD\x07";
+        var reference: std.ArrayList(AbsoluteStop) = .empty;
+        defer reference.deinit(testing.allocator);
+        try testSplits(H, input, &reference, .{ .clipboards = 1 });
+        try testing.expectEqual(@as(usize, 2), reference.items.len);
+        try testing.expectEqual(@as(usize, 2), reference.items[0].end);
+        try testing.expect(reference.items[0].reached.eql(.initOne(.osc_start)));
+        try testing.expectEqual(@as(u8, ']'), reference.items[0].start.?.byte);
+        try testing.expectEqual(@as(usize, input.len), reference.items[1].end);
+        try testing.expect(reference.items[1].reached.eql(osc_end_set));
+        try testing.expectEqual(Boundary.EndReason.bel, reference.items[1].end_info.?.reason);
+    }
+}
+
+test "stream: nextSliceUntil dcs stops do not depend on the split" {
+    inline for (.{ BoundaryTestHandler, BoundaryRawTestHandler }) |H| {
+        // A DCS with an intermediate (DECRQSS) and one with parameters.
+        for ([_][]const u8{ "\x1bP$qm\x1b\\", "\x1bP1;2|data\x1b\\" }) |input| {
+            var reference: std.ArrayList(AbsoluteStop) = .empty;
+            defer reference.deinit(testing.allocator);
+            try testSplits(H, input, &reference, .{ .dcs_hooks = 1, .dcs_unhooks = 1 });
+            try testing.expectEqual(@as(usize, 2), reference.items.len);
+            try testing.expectEqual(@as(usize, 2), reference.items[0].end);
+            try testing.expect(reference.items[0].reached.eql(.initOne(.dcs_start)));
+            try testing.expectEqual(@as(u8, 'P'), reference.items[0].start.?.byte);
+            try testing.expectEqual(@as(usize, input.len - 1), reference.items[1].end);
+            try testing.expect(reference.items[1].reached.eql(dcs_end_set));
+            try testing.expectEqual(Boundary.EndReason.st_esc, reference.items[1].end_info.?.reason);
+        }
+    }
+}
+
+test "stream: nextSliceUntil string end that is also a string start" {
+    inline for (.{ BoundaryTestHandler, BoundaryRawTestHandler }) |H| {
+        // 0x9D inside an APC ends it and starts an OSC on the same byte.
+        {
+            var s: Stream(H) = .init(.{ .handler = .{} });
+            defer s.deinit();
+            const input = "\x1b_a\x9d0;x\x07";
+            var stops: std.ArrayList(AbsoluteStop) = .empty;
+            defer stops.deinit(testing.allocator);
+            try collectStops(&s, input, 0, strings_set, &stops);
+            try testing.expectEqual(@as(usize, 3), stops.items.len);
+            try testing.expect(stops.items[0].reached.eql(apc_start_set));
+
+            const both = stops.items[1];
+            try testing.expectEqual(@as(usize, 4), both.end);
+            try testing.expect(both.reached.eql(.initMany(&.{ .apc_end, .osc_start })));
+            try testing.expectEqual(Boundary.StringKind.apc, both.end_info.?.kind);
+            try testing.expectEqual(Boundary.EndReason.aborted, both.end_info.?.reason);
+            try testing.expectEqual(@as(u8, 0x9D), both.end_info.?.byte);
+            try testing.expectEqual(Boundary.StringKind.osc, both.start.?.kind);
+            try testing.expectEqual(Boundary.Introducer.c1, both.start.?.introducer);
+            try testing.expectEqual(@as(u8, 0x9D), both.start.?.byte);
+
+            try testing.expectEqual(@as(usize, input.len), stops.items[2].end);
+            try testing.expect(stops.items[2].reached.eql(osc_end_set));
+            try testing.expectEqual(Boundary.EndReason.bel, stops.items[2].end_info.?.reason);
+            try testing.expect(s.ground());
+            try testing.expectEqual(@as(usize, 1), boundaryHandler(&s).ended);
+            try testing.expectEqual(false, boundaryHandler(&s).last_terminated.?);
+        }
+
+        // 0x9F inside a DCS header ends it and starts an APC. The DCS
+        // never hooked.
+        {
+            var s: Stream(H) = .init(.{ .handler = .{} });
+            defer s.deinit();
+            const input = "\x1bP1\x9fb\x1b\\";
+            var stops: std.ArrayList(AbsoluteStop) = .empty;
+            defer stops.deinit(testing.allocator);
+            try collectStops(&s, input, 0, strings_set, &stops);
+            try testing.expectEqual(@as(usize, 3), stops.items.len);
+            try testing.expect(stops.items[0].reached.eql(.initOne(.dcs_start)));
+
+            const both = stops.items[1];
+            try testing.expectEqual(@as(usize, 4), both.end);
+            try testing.expect(both.reached.eql(.initMany(&.{ .dcs_end, .apc_start })));
+            try testing.expectEqual(Boundary.StringKind.dcs, both.end_info.?.kind);
+            try testing.expectEqual(Boundary.EndReason.aborted, both.end_info.?.reason);
+            try testing.expectEqual(Boundary.StringKind.apc, both.start.?.kind);
+            try testing.expectEqual(Boundary.Introducer.c1, both.start.?.introducer);
+            try testing.expectEqual(@as(u8, 0x9F), both.start.?.byte);
+
+            try testing.expectEqual(@as(usize, input.len - 1), stops.items[2].end);
+            try testing.expect(stops.items[2].reached.eql(apc_end_set));
+            try testing.expectEqual(Boundary.EndReason.st_esc, stops.items[2].end_info.?.reason);
+            try testing.expect(s.ground());
+            try testing.expectEqual(@as(usize, 0), boundaryHandler(&s).dcs_hooks);
+            try testing.expectEqual(@as(usize, 0), boundaryHandler(&s).dcs_unhooks);
+            try testing.expectEqual(@as(usize, 1), boundaryHandler(&s).started);
+            try testing.expectEqualStrings("b", boundaryHandler(&s).buf[0..boundaryHandler(&s).len]);
+        }
+
+        // 0x90 inside an APC ends it and starts a DCS.
+        {
+            var s: Stream(H) = .init(.{ .handler = .{} });
+            defer s.deinit();
+            const input = "\x1b_a\x90q\x1b\\";
+            var stops: std.ArrayList(AbsoluteStop) = .empty;
+            defer stops.deinit(testing.allocator);
+            try collectStops(&s, input, 0, strings_set, &stops);
+            try testing.expectEqual(@as(usize, 3), stops.items.len);
+            try testing.expect(stops.items[0].reached.eql(apc_start_set));
+
+            const both = stops.items[1];
+            try testing.expectEqual(@as(usize, 4), both.end);
+            try testing.expect(both.reached.eql(.initMany(&.{ .apc_end, .dcs_start })));
+            try testing.expectEqual(Boundary.StringKind.apc, both.end_info.?.kind);
+            try testing.expectEqual(Boundary.EndReason.aborted, both.end_info.?.reason);
+            try testing.expectEqual(Boundary.StringKind.dcs, both.start.?.kind);
+            try testing.expectEqual(Boundary.Introducer.c1, both.start.?.introducer);
+            try testing.expectEqual(@as(u8, 0x90), both.start.?.byte);
+
+            try testing.expectEqual(@as(usize, input.len - 1), stops.items[2].end);
+            try testing.expect(stops.items[2].reached.eql(dcs_end_set));
+            try testing.expectEqual(Boundary.EndReason.st_esc, stops.items[2].end_info.?.reason);
+            try testing.expect(s.ground());
+            try testing.expectEqual(@as(usize, 1), boundaryHandler(&s).dcs_hooks);
+            try testing.expectEqual(@as(usize, 1), boundaryHandler(&s).dcs_unhooks);
+        }
+    }
+}
+
+test "stream: nextSliceUntil combined ground and osc end" {
+    const S = Stream(BoundaryTestHandler);
+    const set: Boundary.Set = .initMany(&.{ .ground, .osc_end });
+
+    // BEL ends the string and reaches ground on the same byte.
+    {
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        s.nextSlice("\x1b]2;ab");
+        const stop = s.nextSliceUntil("\x07x", set).?;
+        try testing.expectEqual(@as(usize, 1), stop.consumed);
+        try testing.expect(stop.reached.eql(set));
+        try testing.expectEqual(Boundary.EndReason.bel, stop.end.?.reason);
+        try testing.expect(s.ground());
+        try testing.expectEqual(@as(usize, 0), s.handler.prints);
+    }
+
+    // ESC ends the string but ground is only reached on the backslash.
+    {
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        s.nextSlice("\x1b]2;ab");
+        const stop = s.nextSliceUntil("\x1b\\x", set).?;
+        try testing.expectEqual(@as(usize, 1), stop.consumed);
+        try testing.expect(stop.reached.eql(osc_end_set));
+        try testing.expectEqual(Boundary.EndReason.st_esc, stop.end.?.reason);
+        try testing.expect(!s.ground());
+
+        const ground_stop = s.nextSliceUntil("\\x", set).?;
+        try testing.expectEqual(@as(usize, 1), ground_stop.consumed);
+        try testing.expect(ground_stop.reached.eql(.initOne(.ground)));
+        try testing.expect(ground_stop.end == null);
+        try testing.expect(s.ground());
+    }
+}
+
 /// Hashes every handler action in a chunking-independent way: bulk
 /// actions are flattened to their per-element form so two streams fed
 /// the same bytes in different pieces hash the same.
@@ -5967,14 +6597,35 @@ fn differential(input: []const u8) !void {
         try testing.expectEqual(reference.parser.state, until.parser.state);
         try testing.expectEqual(reference.utf8decoder.state, until.utf8decoder.state);
         if (stop.reached.contains(.ground)) try testing.expect(until.ground());
+        const kind = Until.family(until.parser.state);
         if (stop.reached.contains(.apc_start)) {
-            try testing.expectEqual(Parser.State.sos_pm_apc_string, until.parser.state);
-            try testing.expect(stop.start != null);
+            try testing.expectEqual(@as(?Boundary.StringKind, .apc), kind);
+            try testing.expectEqual(Boundary.StringKind.apc, stop.start.?.kind);
+        }
+        if (stop.reached.contains(.dcs_start)) {
+            try testing.expectEqual(@as(?Boundary.StringKind, .dcs), kind);
+            try testing.expectEqual(Boundary.StringKind.dcs, stop.start.?.kind);
+        }
+        if (stop.reached.contains(.osc_start)) {
+            try testing.expectEqual(@as(?Boundary.StringKind, .osc), kind);
+            try testing.expectEqual(Boundary.StringKind.osc, stop.start.?.kind);
         }
         if (stop.reached.contains(.apc_end)) {
-            try testing.expect(until.parser.state != .sos_pm_apc_string);
-            try testing.expect(stop.end != null);
+            try testing.expect(kind == null or kind.? != .apc);
+            try testing.expectEqual(Boundary.StringKind.apc, stop.end.?.kind);
         }
+        if (stop.reached.contains(.dcs_end)) {
+            try testing.expect(kind == null or kind.? != .dcs);
+            try testing.expectEqual(Boundary.StringKind.dcs, stop.end.?.kind);
+        }
+        if (stop.reached.contains(.osc_end)) {
+            try testing.expect(kind == null or kind.? != .osc);
+            try testing.expectEqual(Boundary.StringKind.osc, stop.end.?.kind);
+        }
+        // A start and an end of the same kind never coincide.
+        if (stop.start) |start| if (stop.end) |end| {
+            try testing.expect(start.kind != end.kind);
+        };
     }
 
     try testing.expectEqual(plain.parser.state, until.parser.state);
@@ -5984,20 +6635,54 @@ fn differential(input: []const u8) !void {
     try testing.expectEqual(plain.handler.final(), reference.handler.final());
 }
 
+/// Sees every parser action before the stream handles it and notes the
+/// one input shape the stream logs at error level (CSI t with no
+/// parameters), which the test runner would count as a failure.
+const LogErrProbe = struct {
+    csi_t_no_params: bool = false,
+
+    pub fn deinit(_: *@This()) void {}
+
+    pub fn vtRaw(self: *@This(), action: Parser.Action) !bool {
+        switch (action) {
+            .csi_dispatch => |dispatch| if (dispatch.final == 't' and
+                dispatch.intermediates.len == 0 and
+                dispatch.params.len == 0)
+            {
+                self.csi_t_no_params = true;
+            },
+            else => {},
+        }
+        return true;
+    }
+
+    pub fn vt(_: *@This(), comptime _: Action.Tag, _: anytype) void {}
+};
+
+/// True if the stream would log at error level for this input, which
+/// the test runner counts as a failure.
+fn logsErr(input: []const u8) bool {
+    var probe: Stream(LogErrProbe) = .init(.{ .handler = .{} });
+    defer probe.deinit();
+    probe.nextSlice(input);
+    return probe.handler.csi_t_no_params;
+}
+
 test "stream: nextSliceUntil differential on generated streams" {
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5eed);
     const rand = prng.random();
 
-    // Pieces a generated stream is made of. Weighted toward APC and
-    // the bytes that end one, with enough text to cross the 4096-byte
-    // decode chunk.
-    const Piece = enum { text, utf8, csi, osc, apc_esc, apc_c1, apc_cut, raw, big_text, big_apc };
-    const terminators = [_][]const u8{ "\x1b\\", "\x9c", "\x18", "\x1a", "\x9f", "\x90", "\x9b", "\x85", "\x1b[m", "\x1b_" };
+    // Pieces a generated stream is made of. Weighted toward control
+    // strings and the bytes that end one, with enough text to cross
+    // the 4096-byte decode chunk.
+    const Piece = enum { text, utf8, csi, osc, osc_cut, dcs, dcs_cut, apc_esc, apc_c1, apc_cut, raw, big_text, big_apc };
+    const terminators = [_][]const u8{ "\x1b\\", "\x9c", "\x18", "\x1a", "\x9f", "\x90", "\x9b", "\x85", "\x1b[m", "\x1b_", "\x9d", "\x07" };
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
-    for (0..64) |_| {
+    var runs: usize = 0;
+    while (runs < 64) {
         buf.clearRetainingCapacity();
         const pieces = rand.intRangeAtMost(usize, 1, 48);
         for (0..pieces) |_| {
@@ -6027,6 +6712,33 @@ test "stream: nextSliceUntil differential on generated streams" {
                         if (rand.boolean()) "\x07" else "\x1b\\",
                     }));
                 },
+                .osc_cut => {
+                    try buf.appendSlice(alloc, if (rand.boolean()) "\x1b]" else "\x9d");
+                    try buf.appendSlice(alloc, "52;c;");
+                    for (0..rand.intRangeAtMost(usize, 0, 100)) |_| {
+                        try buf.append(alloc, rand.intRangeAtMost(u8, 0x20, 0xFF));
+                    }
+                    try buf.appendSlice(alloc, terminators[rand.uintLessThan(usize, terminators.len)]);
+                },
+                .dcs, .dcs_cut => |kind| {
+                    try buf.appendSlice(alloc, if (rand.boolean()) "\x1bP" else "\x90");
+                    // A header that may be cut short, or a payload.
+                    var seq: [16]u8 = undefined;
+                    try buf.appendSlice(alloc, try std.fmt.bufPrint(&seq, "{d};{d}", .{
+                        rand.intRangeAtMost(u8, 0, 99),
+                        rand.intRangeAtMost(u8, 0, 99),
+                    }));
+                    if (kind == .dcs or rand.boolean()) {
+                        try buf.append(alloc, "q|$p"[rand.uintLessThan(usize, 4)]);
+                        for (0..rand.intRangeAtMost(usize, 0, 100)) |_| {
+                            try buf.append(alloc, rand.intRangeAtMost(u8, 0x00, 0xFF));
+                        }
+                    }
+                    try buf.appendSlice(alloc, if (kind == .dcs)
+                        "\x1b\\"
+                    else
+                        terminators[rand.uintLessThan(usize, terminators.len)]);
+                },
                 .apc_esc, .apc_c1, .apc_cut => |kind| {
                     try buf.appendSlice(alloc, if (kind == .apc_c1) "\x9f" else "\x1b_");
                     try buf.appendSlice(alloc, "Gf=100,a=T;");
@@ -6050,33 +6762,13 @@ test "stream: nextSliceUntil differential on generated streams" {
                 },
             }
         }
+        // Random bytes can spell the one sequence the stream logs an
+        // error for; skip those inputs rather than fail the run.
+        if (logsErr(buf.items)) continue;
         try differential(buf.items);
+        runs += 1;
     }
 }
-
-/// Sees every parser action before the stream handles it and notes the
-/// one input shape the stream logs at error level (CSI t with no
-/// parameters), which the test runner would count as a failure.
-const LogErrProbe = struct {
-    csi_t_no_params: bool = false,
-
-    pub fn deinit(_: *@This()) void {}
-
-    pub fn vtRaw(self: *@This(), action: Parser.Action) !bool {
-        switch (action) {
-            .csi_dispatch => |dispatch| if (dispatch.final == 't' and
-                dispatch.intermediates.len == 0 and
-                dispatch.params.len == 0)
-            {
-                self.csi_t_no_params = true;
-            },
-            else => {},
-        }
-        return true;
-    }
-
-    pub fn vt(_: *@This(), comptime _: Action.Tag, _: anytype) void {}
-};
 
 test "stream: nextSliceUntil differential on the fuzz corpus" {
     const alloc = testing.allocator;
@@ -6098,10 +6790,7 @@ test "stream: nextSliceUntil differential on the fuzz corpus" {
         const data = try dir.readFileAlloc(io, entry.name, alloc, .limited(4 << 20));
         defer alloc.free(data);
 
-        var probe: Stream(LogErrProbe) = .init(.{ .handler = .{} });
-        defer probe.deinit();
-        probe.nextSlice(data);
-        if (probe.handler.csi_t_no_params) {
+        if (logsErr(data)) {
             skipped += 1;
             continue;
         }

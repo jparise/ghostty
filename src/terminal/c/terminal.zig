@@ -1072,6 +1072,10 @@ pub const Boundary = enum(c_int) {
     ground = 1 << 0,
     apc_start = 1 << 1,
     apc_end = 1 << 2,
+    dcs_start = 1 << 3,
+    dcs_end = 1 << 4,
+    osc_start = 1 << 5,
+    osc_end = 1 << 6,
     _,
 
     comptime {
@@ -1122,6 +1126,12 @@ pub const StringEnd = StreamBoundary.EndReason;
 /// for C. Fields that don't apply to a stop are zero, and `reached` tells
 /// the caller which fields apply.
 ///
+/// A stop can be both a string end and a string start, when an 8-bit
+/// introducer of another kind arrives inside an APC or a DCS header. The
+/// Zig stop carries a kind for each. This struct has one `kind` field, so
+/// it holds the kind of the string that ended, and the start flag in
+/// `reached` names the kind that started.
+///
 /// C: GhosttyTerminalWriteStop
 pub const WriteStop = extern struct {
     size: usize = @sizeOf(WriteStop),
@@ -1168,6 +1178,8 @@ pub fn vt_write_until(
         out.introducer = start.introducer;
         out.byte = start.byte;
     }
+    // When a byte both ends and starts a string, the end's kind wins;
+    // see WriteStop.
     if (stop.end) |end| {
         out.kind = end.kind;
         out.end = end.reason;
@@ -3610,7 +3622,7 @@ test "vt_write_until result contract" {
     );
     try testing.expectEqual(WriteStop{}, stop);
 
-    for ([_]u32{ 0, 1 << 3, 1 << 31, ground | 1 << 3 }) |bits| {
+    for ([_]u32{ 0, 1 << 7, 1 << 31, ground | 1 << 7 }) |bits| {
         stop = stale;
         try testing.expectEqual(
             Result.invalid_value,
@@ -3846,6 +3858,150 @@ test "vt_write_until sos and pm report as apc" {
             .byte = final,
         }, stop);
     }
+}
+
+test "vt_write_until osc start and bel end" {
+    const osc_start: u32 = @backingInt(Boundary.osc_start);
+    const osc_end: u32 = @backingInt(Boundary.osc_end);
+    const ground: u32 = @backingInt(Boundary.ground);
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    // The start stop covers ESC and ']'.
+    const input = "\x1b]2;title\x07x";
+    var stop: WriteStop = .{};
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, input, input.len, osc_start | osc_end, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = 2,
+        .reached = osc_start,
+        .kind = .osc,
+        .introducer = .esc,
+        .byte = ']',
+    }, stop);
+    var off: usize = stop.consumed;
+
+    // BEL ends the string and reaches ground on the same byte.
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, input[off..].ptr, input.len - off, ground | osc_end, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = "2;title".len + 1,
+        .reached = ground | osc_end,
+        .kind = .osc,
+        .end = .bel,
+        .byte = 0x07,
+    }, stop);
+    off += stop.consumed;
+    try testing.expectEqual(@as(usize, input.len - 1), off);
+    try testing.expect(t.?.stream.ground());
+}
+
+test "vt_write_until dcs start and end" {
+    const dcs_start: u32 = @backingInt(Boundary.dcs_start);
+    const dcs_end: u32 = @backingInt(Boundary.dcs_end);
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    // The start stop covers ESC and 'P', before the header.
+    const input = "\x1bP1;2|data\x1b\\";
+    var stop: WriteStop = .{};
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, input, input.len, dcs_start | dcs_end, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = 2,
+        .reached = dcs_start,
+        .kind = .dcs,
+        .introducer = .esc,
+        .byte = 'P',
+    }, stop);
+    var off: usize = stop.consumed;
+    try testing.expectEqual(@as(u8, '1'), input[off]);
+
+    // The end stop consumes the ESC of ESC \ but not the backslash.
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, input[off..].ptr, input.len - off, dcs_start | dcs_end, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = "1;2|data".len + 1,
+        .reached = dcs_end,
+        .kind = .dcs,
+        .end = .st_esc,
+        .byte = 0x1B,
+    }, stop);
+    off += stop.consumed;
+    try testing.expectEqual(@as(usize, input.len - 1), off);
+
+    try testing.expectEqual(
+        Result.no_value,
+        vt_write_until(t, "\\", 1, dcs_start | dcs_end, &stop),
+    );
+    try testing.expect(t.?.stream.ground());
+}
+
+test "vt_write_until string end that is also a string start" {
+    const apc_end: u32 = @backingInt(Boundary.apc_end);
+    const osc_start: u32 = @backingInt(Boundary.osc_start);
+    const osc_end: u32 = @backingInt(Boundary.osc_end);
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    // 0x9D inside an APC ends it and starts an OSC on the same byte.
+    // The end's kind is reported; the OSC_START flag names the start.
+    vt_write(t, "\x1b_a", 3);
+    const input = "\x9d0;x\x07";
+    var stop: WriteStop = .{};
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, input, input.len, apc_end | osc_start | osc_end, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = 1,
+        .reached = apc_end | osc_start,
+        .kind = .apc,
+        .introducer = .c1,
+        .end = .aborted,
+        .byte = 0x9D,
+    }, stop);
+
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, input[1..].ptr, input.len - 1, apc_end | osc_start | osc_end, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = 4,
+        .reached = osc_end,
+        .kind = .osc,
+        .end = .bel,
+        .byte = 0x07,
+    }, stop);
 }
 
 test "vt_write split escape sequence" {
