@@ -15,10 +15,11 @@ doc: |
   this schema. Each SCREEN declares its complete logical history extent before
   READY.
 
-  Optional Kitty graphics records carry each screen's images and placements:
-  KITTY_IMAGE_STORAGE right after a screen's SCREEN and PAGE records, and
-  KITTY_IMAGE_PAGE_PLACEMENTS right after a history PAGE that has placements
-  on it.
+  Optional Kitty graphics records carry each screen's images, pixels and
+  placements: KITTY_IMAGE_STORAGE right after a screen's SCREEN and PAGE
+  records, KITTY_IMAGE_PAGE_PLACEMENTS right after a history PAGE that has
+  placements on it, and KITTY_IMAGE_PAYLOAD records anywhere between READY
+  and FINISH, except between a PAGE and its KITTY_IMAGE_PAGE_PLACEMENTS.
 
   A decoder skips every record whose tag it does not know, wherever it
   appears, after checking its length and CRC32C. This lets newer encoders
@@ -47,6 +48,7 @@ enums:
     6: finish
     7: continuation
     8: kitty_image_storage
+    9: kitty_image_payload
     10: kitty_image_page_placements
   kitty_format:
     0: rgb
@@ -214,6 +216,7 @@ types:
             3: page_payload
             4: history_payload
             8: kitty_image_storage_payload
+            9: kitty_image_payload_payload
             10: kitty_image_page_placements_payload
 
   record_header_any:
@@ -1428,6 +1431,32 @@ types:
       - id: background
         type: u4
 
+
+  kitty_image_payload_payload:
+    doc: |
+      The pixels of one image or animation frame. Frames are numbered as
+      the Kitty graphics protocol numbers them: frame 1 is the image itself
+      and frames 2 and up are its animation frames. Compressed data is a
+      zlib stream that inflates to exactly decoded_length bytes.
+    seq:
+      - id: key
+        type: u2
+        enum: screen_key
+        valid:
+          expr: _.to_i <= 1
+      - id: image_id
+        type: u4
+      - id: frame
+        type: u4
+        valid:
+          min: 1
+      - id: decoded_length
+        type: u8
+      - id: compression
+        type: u1
+        enum: kitty_compression
+      - id: data
+        size-eos: true
 
   kitty_image_page_placements_payload:
     doc: Placements pinned to the preceding history PAGE, parents first.

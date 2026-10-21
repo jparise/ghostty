@@ -120,6 +120,10 @@ pub const Tag = enum(u16) {
     /// load. Optional. See `kitty.zig`.
     kitty_image_storage = 8,
 
+    /// The pixels of one Kitty graphics image or animation frame.
+    /// Optional. See `kitty.zig`.
+    kitty_image_payload = 9,
+
     /// The Kitty graphics placements pinned to the history PAGE right
     /// before this record. Optional. See `kitty.zig`.
     kitty_image_page_placements = 10,
@@ -150,6 +154,7 @@ pub const Tag = enum(u16) {
             // A build without Kitty graphics skips these records and
             // restores the terminal without its images.
             .kitty_image_storage,
+            .kitty_image_payload,
             .kitty_image_page_placements,
             => build_options.kitty_graphics,
 

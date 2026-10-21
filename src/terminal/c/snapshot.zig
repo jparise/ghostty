@@ -94,7 +94,7 @@ const DecoderWrapper = struct {
         history: struct {
             terminal: terminal_c.Terminal,
             metadata: Metadata,
-            progress: ?snapshot_core.Decoder.Progress = null,
+            progress: ?snapshot_core.Decoder.Progress.Page = null,
         },
 
         finished: Metadata,
@@ -320,7 +320,7 @@ fn decoderMetadata(
 /// Return page progress only during incremental history decoding.
 fn decoderProgress(
     decoder: *const DecoderWrapper,
-) ?snapshot_core.Decoder.Progress {
+) ?snapshot_core.Decoder.Progress.Page {
     return switch (decoder.state) {
         .history => |value| value.progress,
         else => null,
@@ -406,8 +406,13 @@ pub fn decoder_next(
     };
 
     // Publish page progress, or transition permanently to validated FINISH.
+    // The C API reports page progress only. After an image record, the
+    // page getters report no value.
     if (progress) |value| {
-        history.progress = value;
+        history.progress = switch (value) {
+            .page => |page| page,
+            .image => null,
+        };
         return .success;
     }
 

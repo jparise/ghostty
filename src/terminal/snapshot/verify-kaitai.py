@@ -20,8 +20,9 @@ snapshot.ksy as the source of truth and ensures this check cannot accidentally
 pass against stale generated code. After structural parsing, the script checks
 what portable Kaitai expressions cannot represent: every record's CRC32C,
 including records with unknown tags, the order, declared counts and screen
-keys of the known records, and that Kitty graphics image lengths and pins
-are consistent with the pages and images they refer to.
+keys of the known records, that Kitty graphics image lengths and pins are
+consistent with the pages and images they refer to, and that every pixel
+payload decodes to exactly the length its image or frame expects.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -197,10 +199,12 @@ TAG_READY = 5
 TAG_FINISH = 6
 TAG_CONTINUATION = 7
 TAG_KITTY_IMAGE_STORAGE = 8
+TAG_KITTY_IMAGE_PAYLOAD = 9
 TAG_KITTY_IMAGE_PAGE_PLACEMENTS = 10
 KNOWN_TAGS = {
     *range(TAG_TERMINAL, TAG_CONTINUATION + 1),
     TAG_KITTY_IMAGE_STORAGE,
+    TAG_KITTY_IMAGE_PAYLOAD,
     TAG_KITTY_IMAGE_PAGE_PLACEMENTS,
 }
 KITTY_BPP = {"rgb": 3, "rgba": 4, "gray_alpha": 2, "gray": 1}
@@ -230,6 +234,10 @@ class Structure:
     terminal: Any
     screens: list[Sequence]
     continuation: Any
+
+    # The KITTY_IMAGE_PAYLOAD records between READY and FINISH, in order.
+    kitty_image_payloads: list[Any]
+
     histories: list[Sequence]
 
 
@@ -249,6 +257,11 @@ class KnownRecords:
         ]
         self.index = 0
 
+        # Once READY is taken, KITTY_IMAGE_PAYLOAD records may come before any
+        # other record. take collects them here.
+        self.allow_payloads = False
+        self.payloads: list[Any] = []
+
     def peek(self) -> int | None:
         """Return the tag of the next known record, or None at the end."""
         if self.index >= len(self.records):
@@ -256,7 +269,11 @@ class KnownRecords:
         return self.records[self.index].header.tag
 
     def take(self, tag: int) -> Any:
-        """Consume the next known record, which must have this tag."""
+        """Consume the next known record, which must have this tag. After
+        READY, KITTY_IMAGE_PAYLOAD records before it are collected first."""
+        while self.allow_payloads and self.peek() == TAG_KITTY_IMAGE_PAYLOAD:
+            self.payloads.append(self.records[self.index])
+            self.index += 1
         actual = self.peek()
         if actual != tag:
             raise ValueError(f"expected record tag {tag}, found {actual}")
@@ -265,7 +282,10 @@ class KnownRecords:
         return record
 
     def take_optional(self, tag: int) -> Any | None:
-        """Consume the next known record if it has this tag."""
+        """Consume the next known record if it has this tag. A
+        KITTY_IMAGE_PAYLOAD in between means the record is absent, which is
+        how a payload between a PAGE and its KITTY_IMAGE_PAGE_PLACEMENTS is
+        caught."""
         return self.take(tag) if self.peek() == tag else None
 
     def take_sequence(self, tag: int, page_count: Any) -> Sequence:
@@ -305,6 +325,8 @@ def snapshot_structure(snapshot: Any) -> Structure:
     ]
     continuation = records.take(TAG_CONTINUATION)
     records.take(TAG_READY)
+    records.allow_payloads = True
+
     histories = [
         records.take_sequence(
             TAG_HISTORY,
@@ -320,6 +342,7 @@ def snapshot_structure(snapshot: Any) -> Structure:
         terminal=terminal,
         screens=screens,
         continuation=continuation,
+        kitty_image_payloads=records.payloads,
         histories=histories,
     )
 
@@ -331,16 +354,52 @@ def validate_kitty_pin(pin: Any, page: Any, label: str) -> None:
         raise ValueError(f"{label}: pin outside its page")
 
 
+def validate_kitty_image_payload(
+    payload: Any,
+    images_by_key: dict[Any, dict[int, Any]],
+) -> None:
+    """Require a KITTY_IMAGE_PAYLOAD to name a declared screen and an image or
+    frame on it, and to decode to exactly that length."""
+    images = images_by_key.get(payload.key)
+    if images is None:
+        raise ValueError(
+            f"KITTY_IMAGE_PAYLOAD names undeclared screen {payload.key}"
+        )
+    image = images.get(payload.image_id)
+    if image is None:
+        raise ValueError(f"payload for unknown image {payload.image_id}")
+    if payload.frame == 1:
+        expected = image.data_length
+    else:
+        animation = getattr(image, "animation", None)
+        frames = animation.frames if animation is not None else []
+        if payload.frame - 2 >= len(frames):
+            raise ValueError("payload for a missing animation frame")
+        expected = frames[payload.frame - 2].data_length
+    if payload.decoded_length != expected:
+        raise ValueError("payload decoded_length mismatch")
+    data = payload.data
+    if payload.compression.name == "zlib":
+        data = zlib.decompress(data)
+    if len(data) != payload.decoded_length:
+        raise ValueError("payload does not decode to decoded_length")
+
+
 def validate_kitty(structure: Structure) -> None:
     """Validate the Kitty graphics records: screen keys, image and frame
-    lengths, and that every pin names a cell of its page."""
+    lengths, that every pin names a cell of its page, and that every pixel
+    payload belongs to an image and decodes to its expected length."""
+    images_by_key: dict[Any, dict[int, Any]] = {}
     for screen in structure.screens:
+        key = screen.record.payload.header.key
+        images_by_key[key] = {}
         storage = screen.kitty_image_storage
         if storage is None:
             continue
         payload = storage.payload
-        if payload.key != screen.record.payload.header.key:
+        if payload.key != key:
             raise ValueError("KITTY_IMAGE_STORAGE key differs from its SCREEN")
+        images_by_key[key] = {image.id: image for image in payload.images}
 
         for image in payload.images:
             if image.format.name not in KITTY_BPP:
@@ -370,6 +429,9 @@ def validate_kitty(structure: Structure) -> None:
                 screen.pages[pin.page],
                 "KITTY_IMAGE_STORAGE",
             )
+
+    for record in structure.kitty_image_payloads:
+        validate_kitty_image_payload(record.payload, images_by_key)
 
     for sequence in structure.histories:
         key = sequence.record.payload.key

@@ -103,7 +103,17 @@ pub fn encode(
     // 5. Ready marker.
     try checkpoint.encode(.ready, &stream);
 
-    // 6. Each screen's history, with the Kitty graphics placements pinned
+    // 6. Each screen's Kitty graphics pixels. They come after READY so
+    // the decoder can show the terminal without waiting for them.
+    if (comptime build_options.kitty_graphics) {
+        for (std.enums.values(TerminalScreenKey)) |key| {
+            if (kitty_plans.getPtr(key).*) |*plan| {
+                try plan.encodePayloads(&stream);
+            }
+        }
+    }
+
+    // 7. Each screen's history, with the Kitty graphics placements pinned
     // to each page.
     for (std.enums.values(TerminalScreenKey)) |key| {
         const s = t.screens.get(key) orelse continue;
@@ -116,7 +126,7 @@ pub fn encode(
         );
     }
 
-    // 7. Finish
+    // 8. Finish
     try checkpoint.encode(.finish, &stream);
 }
 
@@ -193,6 +203,29 @@ pub const Decoded = struct {
     /// READY, before HISTORY pages arrive; native row totals always remain
     /// derived from the pages actually applied.
     history_rows: std.EnumMap(TerminalScreenKey, u64),
+
+    /// For each screen, how many Kitty graphics images were restored and
+    /// how many bytes of their pixels are still to come through
+    /// `Decoder.next`. Screens without images, and every screen in a build
+    /// without Kitty graphics, report zeros.
+    ///
+    /// This is meant for showing progress while the pixels arrive:
+    ///
+    /// ```zig
+    /// const total = decoded.kitty.get(.primary).pending_bytes;
+    /// var received: u64 = 0;
+    /// while (try decoder.next(alloc, &terminal)) |progress| switch (progress) {
+    ///     .image => |image| if (image.key == .primary) {
+    ///         received += image.bytes;
+    ///     },
+    ///     .page => {},
+    /// };
+    /// ```
+    ///
+    /// Pixels that the decoder drops report zero bytes, so `received` can
+    /// end up below `total`. Pixels may arrive between history pages, so
+    /// they are only known to be done once `next` returns null.
+    kitty: std.EnumArray(TerminalScreenKey, kitty.Counts) = .initFill(.{}),
 
     /// Destroy an untransferred Terminal and always free continuation bytes.
     /// After `toOwned`, this leaves the caller-owned Terminal untouched.
@@ -357,9 +390,10 @@ pub const Decoder = struct {
     /// arrives through `next`. Asserts this is the first call.
     ///
     /// The Terminal also has every Kitty graphics image from the snapshot,
-    /// and the placements on its screens. Image pixels are not in the
-    /// snapshot yet, so the images are pending. Placements on history pages
-    /// arrive with their pages through `next`.
+    /// and the placements on its screens. The pixels arrive later through
+    /// `next`, and the images are pending until then. Placements on history
+    /// pages also arrive through `next`, together with their pages.
+    /// `Decoded.kitty` says how many pixels are still to come.
     pub fn ready(
         self: *Decoder,
         alloc: Allocator,
@@ -481,16 +515,18 @@ pub const Decoder = struct {
         // arrives.
         var generations: std.EnumMap(TerminalScreenKey, usize) = .init(.{});
         var kitty_generations: std.EnumMap(TerminalScreenKey, u64) = .init(.{});
+        var kitty_counts: std.EnumArray(TerminalScreenKey, kitty.Counts) = .initFill(.{});
         var it = result.screens.all.iterator();
         while (it.next()) |entry| {
             generations.put(
                 entry.key,
                 result.screens.generation(entry.key),
             );
-            if (comptime build_options.kitty_graphics) kitty_generations.put(
-                entry.key,
-                entry.value.*.kitty_images.generation,
-            );
+            if (comptime build_options.kitty_graphics) {
+                const storage = &entry.value.*.kitty_images;
+                kitty_generations.put(entry.key, storage.generation);
+                kitty_counts.set(entry.key, .init(storage));
+            }
         }
 
         self.state = .{ .history = .{
@@ -506,20 +542,53 @@ pub const Decoder = struct {
             .terminal = result,
             .continuation = decoded_continuation,
             .history_rows = history_rows,
+            .kitty = kitty_counts,
         };
     }
 
-    /// One history PAGE record consumed by `next`.
-    pub const Progress = struct {
-        /// The screen whose HISTORY sequence contained the decoded page.
-        key: TerminalScreenKey,
+    /// One record consumed by `next`.
+    ///
+    /// ```zig
+    /// while (try decoder.next(alloc, &terminal)) |progress| switch (progress) {
+    ///     .image => |image| log.debug("image {} arrived", .{image.image_id}),
+    ///     .page => |page| log.debug("{} rows of scrollback", .{page.rows}),
+    /// };
+    /// ```
+    pub const Progress = union(enum) {
+        /// A history PAGE, together with its Kitty graphics placements.
+        page: Page,
 
-        /// Rows prepended above that screen's existing content, or zero
-        /// when the page was consumed and validated but dropped.
-        rows: usize,
+        /// The pixels of a Kitty graphics image or animation frame.
+        image: Image,
 
-        /// PAGE records still pending in the same HISTORY sequence.
-        remaining: u32,
+        pub const Page = struct {
+            /// The screen whose HISTORY contained the page.
+            key: TerminalScreenKey,
+
+            /// Rows prepended above that screen's existing content, or zero
+            /// when the page was consumed and validated but dropped.
+            rows: usize,
+
+            /// PAGE records still to come in the same HISTORY.
+            remaining: u32,
+        };
+
+        pub const Image = struct {
+            /// The screen the image is on.
+            key: TerminalScreenKey,
+
+            /// The ID of the image the pixels are for.
+            image_id: u32,
+
+            /// The frame the pixels are for, as the Kitty graphics protocol
+            /// counts frames. 1 is the image itself and 2 and up are its
+            /// animation frames.
+            frame: u32,
+
+            /// The number of pixel bytes attached to the image, or zero
+            /// when the pixels were consumed and validated but dropped.
+            bytes: usize,
+        };
     };
 
     /// Errors possible while decoding history records through FINISH.
@@ -551,7 +620,8 @@ pub const Decoder = struct {
             PageSizeOverflow,
         };
 
-    /// Decode one history PAGE record and prepend it to its screen in `t`.
+    /// Decode one history PAGE record and prepend it to its screen in `t`,
+    /// or decode the pixels of one Kitty graphics image or animation frame.
     ///
     /// `t` must be the Terminal restored by this decoder's `ready` call,
     /// wherever the caller now stores it. Returns null once FINISH has
@@ -579,6 +649,16 @@ pub const Decoder = struct {
     /// The Kitty graphics placements pinned to a page are restored by the
     /// same call as the page. When a page is dropped, its placements are
     /// dropped too.
+    ///
+    /// Kitty graphics pixels may come at any point, even between history
+    /// pages, one image or frame per call. `next` reports them as
+    /// `Progress.image`. Like pages, they are never applied where they no
+    /// longer belong. The pixels are consumed but dropped, reported as zero
+    /// bytes, when:
+    ///
+    ///   * their screen was removed, or removed and recreated, since READY;
+    ///   * live input deleted the image, or sent a new image with the same
+    ///     ID, since READY.
     pub fn next(
         self: *Decoder,
         alloc: Allocator,
@@ -596,17 +676,25 @@ pub const Decoder = struct {
         const state = &self.state.history;
 
         while (true) {
-            // Stream the current sequence's next PAGE if one remains.
-            if (state.current) |*sequence| {
-                if (sequence.remaining > 0) {
-                    return try self.nextPage(alloc, t, sequence);
-                }
-                state.current = null;
-            }
-
             // Read the next header before deciding how to decode the
             // record. Unknown records before it were skipped.
             const header = try self.takeHeader();
+
+            // Kitty graphics pixels may come anywhere after READY, even
+            // between the pages of a HISTORY sequence, in any screen order.
+            if (comptime build_options.kitty_graphics) {
+                if (header.tag == .kitty_image_payload) {
+                    return try self.nextPayload(alloc, t, header);
+                }
+            }
+
+            // Stream the current sequence's next PAGE if one remains.
+            if (state.current) |*sequence| {
+                if (sequence.remaining > 0) {
+                    return try self.nextPage(alloc, t, sequence, header);
+                }
+                state.current = null;
+            }
 
             // All sequences are consumed: FINISH ends the snapshot, leaving
             // trailing transport bytes unread.
@@ -658,15 +746,74 @@ pub const Decoder = struct {
         return try record.nextHeader(self.source);
     }
 
-    /// Consume one PAGE record from the current sequence, applying it to
-    /// the live terminal when it is still applicable and discarding it
-    /// otherwise. The page's Kitty graphics placements are restored with
-    /// it, or dropped with it.
+    /// The screen for `key` in `t`, if it is still the screen restored at
+    /// READY. Returns null if live input removed it, or removed it and
+    /// created a new one, since then.
+    fn restoredScreen(
+        self: *const Decoder,
+        t: *Terminal,
+        key: TerminalScreenKey,
+    ) ?*TerminalScreen {
+        const state = &self.state.history;
+        const restored = t.screens.get(key) orelse return null;
+        if (t.screens.generation(key) != state.generations.get(key).?) {
+            return null;
+        }
+        return restored;
+    }
+
+    /// Consume one KITTY_IMAGE_PAYLOAD record, attaching its pixels to their
+    /// image when it is still the one restored at READY and dropping them
+    /// otherwise.
+    fn nextPayload(
+        self: *Decoder,
+        alloc: Allocator,
+        t: *Terminal,
+        header: record.Header,
+    ) NextError!Progress {
+        if (comptime !build_options.kitty_graphics) unreachable;
+        const state = &self.state.history;
+
+        // Pixels may go to any screen restored at READY that live input
+        // hasn't removed or replaced since.
+        var targets: kitty.PayloadTargets = .init(.{});
+        var it = state.generations.iterator();
+        while (it.next()) |entry| {
+            const restored = self.restoredScreen(t, entry.key) orelse continue;
+            targets.put(entry.key, .{
+                .screen = restored,
+                .ready_generation = state.kitty_generations.get(entry.key).?,
+            });
+        }
+
+        const payload = try kitty.decodePayload(
+            self.source,
+            header,
+            t.screens.active.io,
+            alloc,
+            targets,
+        );
+        if (state.generations.get(payload.key) == null) {
+            return error.UnexpectedKittyKey;
+        }
+        return .{ .image = .{
+            .key = payload.key,
+            .image_id = payload.image_id,
+            .frame = payload.frame,
+            .bytes = payload.bytes,
+        } };
+    }
+
+    /// Consume one PAGE record from the current sequence, whose header
+    /// `next` already read, applying it to the live terminal when it is
+    /// still applicable and discarding it otherwise. The page's Kitty
+    /// graphics placements are restored with it, or dropped with it.
     fn nextPage(
         self: *Decoder,
         alloc: Allocator,
         t: *Terminal,
         sequence: *Sequence,
+        header: record.Header,
     ) NextError!Progress {
         const state = &self.state.history;
 
@@ -675,18 +822,10 @@ pub const Decoder = struct {
         const destination: ?*TerminalScreen = destination: {
             if (!sequence.apply) break :destination null;
             if (t.cols != state.cols) break :destination null;
-            const restored = t.screens.get(sequence.key) orelse
-                break :destination null;
-            if (t.screens.generation(sequence.key) !=
-                state.generations.get(sequence.key).?)
-            {
-                break :destination null;
-            }
-            break :destination restored;
+            break :destination self.restoredScreen(t, sequence.key);
         };
 
         sequence.remaining -= 1;
-        const header = try self.takeHeader();
         const applied: ?*TerminalScreen, const rows: usize = rows: {
             const restored = destination orelse {
                 // The record must still be consumed so decoding remains
@@ -723,11 +862,11 @@ pub const Decoder = struct {
             break :rows .{ restored, rows };
         };
 
-        const progress: Progress = .{
+        const progress: Progress = .{ .page = .{
             .key = sequence.key,
             .rows = rows,
             .remaining = sequence.remaining,
-        };
+        } };
 
         // The page's Kitty graphics placements, if any, follow it. Read the
         // next header to find out. Anything else waits for the next call,
@@ -1994,20 +2133,20 @@ test "incremental decode restores a renderable terminal at READY" {
 
     // Each call prepends exactly one history page, newest first.
     const first = (try decoder.next(testing.allocator, &restored)).?;
-    try testing.expectEqualDeep(Decoder.Progress{
+    try testing.expectEqualDeep(Decoder.Progress{ .page = .{
         .key = .primary,
         .rows = 2,
         .remaining = 1,
-    }, first);
+    } }, first);
     try testing.expectEqual(5, primary.pages.scrollbar().total);
     try testing.expectEqual(@as(u21, 'B'), testTopLeftCodepoint(primary));
 
     const second = (try decoder.next(testing.allocator, &restored)).?;
-    try testing.expectEqualDeep(Decoder.Progress{
+    try testing.expectEqualDeep(Decoder.Progress{ .page = .{
         .key = .primary,
         .rows = 2,
         .remaining = 0,
-    }, second);
+    } }, second);
     try testing.expectEqual(7, primary.pages.scrollbar().total);
     try testing.expectEqual(@as(u21, 'A'), testTopLeftCodepoint(primary));
 
@@ -2079,8 +2218,8 @@ test "incremental decode applies history below live PTY output" {
     // History still lands above both the snapshot content and the live
     // output, preserving complete scrollback ordering.
     while (try decoder.next(testing.allocator, &restored)) |progress| {
-        try testing.expectEqual(TerminalScreenKey.primary, progress.key);
-        try testing.expectEqual(2, progress.rows);
+        try testing.expectEqual(TerminalScreenKey.primary, progress.page.key);
+        try testing.expectEqual(2, progress.page.rows);
     }
     try testing.expectEqual(live_total + 4, primary.pages.scrollbar().total);
     try testing.expectEqual(@as(u21, 'A'), testTopLeftCodepoint(primary));
@@ -2154,8 +2293,8 @@ test "incremental decode discards history for screens changed since READY" {
         const restored = &decoded.terminal.?;
 
         const progress = (try decoder.next(testing.allocator, restored)).?;
-        try testing.expectEqual(TerminalScreenKey.alternate, progress.key);
-        try testing.expect(progress.rows > 0);
+        try testing.expectEqual(TerminalScreenKey.alternate, progress.page.key);
+        try testing.expect(progress.page.rows > 0);
         try testing.expect(try decoder.next(testing.allocator, restored) == null);
         try testing.expectEqual(
             @as(usize, 2),
@@ -2178,11 +2317,11 @@ test "incremental decode discards history for screens changed since READY" {
         restored.screens.remove(testing.allocator, .alternate);
 
         const progress = (try decoder.next(testing.allocator, restored)).?;
-        try testing.expectEqualDeep(Decoder.Progress{
+        try testing.expectEqualDeep(Decoder.Progress{ .page = .{
             .key = .alternate,
             .rows = 0,
             .remaining = 0,
-        }, progress);
+        } }, progress);
         try testing.expect(try decoder.next(testing.allocator, restored) == null);
     }
 
@@ -2202,8 +2341,8 @@ test "incremental decode discards history for screens changed since READY" {
         _ = try restored.switchScreen(.alternate);
 
         const progress = (try decoder.next(testing.allocator, restored)).?;
-        try testing.expectEqual(TerminalScreenKey.alternate, progress.key);
-        try testing.expectEqual(0, progress.rows);
+        try testing.expectEqual(TerminalScreenKey.alternate, progress.page.key);
+        try testing.expectEqual(0, progress.page.rows);
         try testing.expect(try decoder.next(testing.allocator, restored) == null);
         try testing.expectEqual(
             @as(usize, 1),
@@ -2240,8 +2379,8 @@ test "incremental decode discards history after a resize" {
 
     var pages: usize = 0;
     while (try decoder.next(testing.allocator, &restored)) |progress| {
-        try testing.expectEqual(TerminalScreenKey.primary, progress.key);
-        try testing.expectEqual(0, progress.rows);
+        try testing.expectEqual(TerminalScreenKey.primary, progress.page.key);
+        try testing.expectEqual(0, progress.page.rows);
         pages += 1;
     }
     try testing.expectEqual(2, pages);
@@ -2278,7 +2417,7 @@ test "decode drops history beyond the declared scrollback limits" {
         var rows: [3]usize = undefined;
         var pages: usize = 0;
         while (try decoder.next(testing.allocator, restored)) |progress| {
-            rows[pages] = progress.rows;
+            rows[pages] = progress.page.rows;
             pages += 1;
         }
         try testing.expectEqual(3, pages);
@@ -2332,7 +2471,7 @@ test "incremental decode failure leaves applied history usable" {
 
     for (0..2) |_| {
         const progress = (try decoder.next(testing.allocator, &restored)).?;
-        try testing.expectEqual(2, progress.rows);
+        try testing.expectEqual(2, progress.page.rows);
     }
     try testing.expectError(
         error.EndOfStream,

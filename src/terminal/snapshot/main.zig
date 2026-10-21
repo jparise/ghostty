@@ -57,6 +57,10 @@
 //! +----------------------------------------+
 //! | READY                                  |
 //! +----------------------------------------+
+//! | KITTY_IMAGE_PAYLOAD (optional, per     |
+//! |   image or frame, anywhere until       |
+//! |   FINISH)                              |
+//! +----------------------------------------+
 //! | HISTORY * terminal.screen_count        |
 //! | PAGE * each history.page_count         |
 //! | KITTY_IMAGE_PAGE_PLACEMENTS (optional, |
@@ -66,8 +70,8 @@
 //! +----------------------------------------+
 //! ```
 //!
-//! The optional Kitty graphics records carry each screen's images and
-//! placements. They are only written for screens that have images. See
+//! The optional Kitty graphics records carry each screen's images, pixels
+//! and placements. They are only written for screens that have images. See
 //! `kitty.zig`.
 //!
 //! A decoder skips any record whose tag it does not know, wherever it
@@ -162,10 +166,14 @@
 //! defer terminal.deinit(alloc);
 //!
 //! // Render, replay the continuation, process input...
-//! while (try decoder.next(alloc, &terminal)) |progress| {
-//!     _ = progress; // Scrollback grew.
-//! }
+//! while (try decoder.next(alloc, &terminal)) |progress| switch (progress) {
+//!     .image => {}, // An image's pixels arrived.
+//!     .page => {}, // Scrollback grew.
+//! };
 //! ```
+//!
+//! Kitty graphics images are restored at READY with their pixels pending.
+//! `next` then delivers the pixels, which may be mixed in with history.
 //!
 //! ### Compressed History
 //!
