@@ -217,8 +217,13 @@ pub const DecodePageError = Allocator.Error ||
 ///
 /// With `options.compress`, the page is compressed after it is added. A
 /// page that cannot be compressed is kept uncompressed and is not an error.
+///
+/// `record_header` is the PAGE record's header, already read from `source`.
+/// A header for any other kind of record returns
+/// `error.UnexpectedRecordTag`. See "Decoding Records" in `record.zig`.
 pub fn decodePage(
     source: *std.Io.Reader,
+    record_header: record.Header,
     alloc: Allocator,
     terminal_screen: *TerminalScreen,
     options: DecodeOptions,
@@ -226,7 +231,7 @@ pub fn decodePage(
     // PAGE exposes its exact capacity before decoding the payload, allowing
     // the destination PageList to allocate the final backing memory once.
     var decoder: page.Decoder = undefined;
-    try decoder.init(source);
+    try decoder.init(source, record_header);
     var allocation = try terminal_screen.pages.allocatePage(
         decoder.capacity(),
     );
@@ -249,22 +254,32 @@ pub const Decoder = struct {
     header: Header,
 
     pub const InitError = Header.DecodeError ||
-        record.Reader.InitError ||
         record.Reader.FinishError ||
         error{
-            /// The next record is valid but is not a HISTORY.
+            /// The record is valid but is not a HISTORY.
             UnexpectedRecordTag,
         };
 
-    pub const RestoreError = DecodePageError || error{
+    pub const RestoreError = DecodePageError || record.NextHeaderError || error{
         /// The Screen already contains complete pages before its active page.
         ExistingHistory,
     };
 
     /// Decode and finish the self-contained HISTORY manifest.
-    pub fn init(self: *Decoder, source: *std.Io.Reader) InitError!void {
+    ///
+    /// `record_header` is the HISTORY record's header, already read from
+    /// `source`. A header for any other kind of record returns
+    /// `error.UnexpectedRecordTag`. See "Decoding Records" in `record.zig`.
+    ///
+    /// The PAGE records that follow are not read here. Restore them with
+    /// `decode`, or one at a time with `history.decodePage`.
+    pub fn init(
+        self: *Decoder,
+        source: *std.Io.Reader,
+        record_header: record.Header,
+    ) InitError!void {
         var record_reader: record.Reader = undefined;
-        try record_reader.init(source);
+        record_reader.initHeader(source, record_header);
         if (record_reader.header.tag != .history) {
             return error.UnexpectedRecordTag;
         }
@@ -292,6 +307,7 @@ pub const Decoder = struct {
         for (0..self.header.page_count) |_| {
             _ = try decodePage(
                 self.source,
+                try record.nextHeader(self.source),
                 alloc,
                 terminal_screen,
                 options,
@@ -309,15 +325,32 @@ pub const Decoder = struct {
 /// prepended only after its record and native integrity are validated. If a
 /// later PAGE fails, earlier successful pages remain as a contiguous recent
 /// history prefix.
+///
+/// `record_header` is the HISTORY record's header, already read from
+/// `source`. A header for any other kind of record returns
+/// `error.UnexpectedRecordTag`. This function reads the headers of the PAGE
+/// records that follow itself. See "Decoding Records" in `record.zig`.
+///
+/// ```zig
+/// try history.decode(
+///     source,
+///     try record.nextHeader(source),
+///     alloc,
+///     .primary,
+///     screen,
+///     .{},
+/// );
+/// ```
 pub fn decode(
     source: *std.Io.Reader,
+    record_header: record.Header,
     alloc: Allocator,
     expected_key: TerminalScreenKey,
     terminal_screen: *TerminalScreen,
     options: DecodeOptions,
 ) DecodeError!void {
     var decoder: Decoder = undefined;
-    try decoder.init(source);
+    try decoder.init(source, record_header);
     if (decoder.header.key != expected_key) return error.UnexpectedScreenKey;
     try decoder.decode(alloc, terminal_screen, options);
 }
@@ -459,6 +492,7 @@ test "HISTORY encodes newest first and restores complete history" {
 
     var decoded_newest = try page.decode(
         &history_source,
+        try record.nextHeader(&history_source),
         std.testing.allocator,
     );
     defer decoded_newest.deinit();
@@ -468,6 +502,7 @@ test "HISTORY encodes newest first and restores complete history" {
     );
     var decoded_oldest = try page.decode(
         &history_source,
+        try record.nextHeader(&history_source),
         std.testing.allocator,
     );
     defer decoded_oldest.deinit();
@@ -481,6 +516,7 @@ test "HISTORY encodes newest first and restores complete history" {
     var restore_source: std.Io.Reader = .fixed(destination.written());
     var decoded_screen = try screen.decode(
         &restore_source,
+        try record.nextHeader(&restore_source),
         std.testing.io,
         std.testing.allocator,
         .{
@@ -502,6 +538,7 @@ test "HISTORY encodes newest first and restores complete history" {
     try std.testing.expect(!restored.semantic_prompt.seen);
     try decode(
         &restore_source,
+        try record.nextHeader(&restore_source),
         std.testing.allocator,
         .primary,
         restored,
@@ -548,6 +585,7 @@ test "HISTORY encodes newest first and restores complete history" {
     );
     var decoded_truncated = try screen.decode(
         &truncated_source,
+        try record.nextHeader(&truncated_source),
         std.testing.io,
         std.testing.allocator,
         .{
@@ -564,6 +602,7 @@ test "HISTORY encodes newest first and restores complete history" {
         error.EndOfStream,
         decode(
             &truncated_source,
+            try record.nextHeader(&truncated_source),
             std.testing.allocator,
             .primary,
             truncated,
@@ -593,6 +632,7 @@ test "HISTORY encodes newest first and restores complete history" {
     var partial_source: std.Io.Reader = .fixed(encoded);
     var decoded_partial = try screen.decode(
         &partial_source,
+        try record.nextHeader(&partial_source),
         std.testing.io,
         std.testing.allocator,
         .{
@@ -608,6 +648,7 @@ test "HISTORY encodes newest first and restores complete history" {
         error.UnexpectedRecordTag,
         decode(
             &partial_source,
+            try record.nextHeader(&partial_source),
             std.testing.allocator,
             .primary,
             partial,
@@ -665,6 +706,7 @@ test "HISTORY decode compresses history pages when requested" {
         var restore_source: std.Io.Reader = .fixed(destination.written());
         var decoded_screen = try screen.decode(
             &restore_source,
+            try record.nextHeader(&restore_source),
             std.testing.io,
             alloc,
             screen_options,
@@ -673,6 +715,7 @@ test "HISTORY decode compresses history pages when requested" {
         const restored = &decoded_screen.screen;
         try decode(
             &restore_source,
+            try record.nextHeader(&restore_source),
             alloc,
             .primary,
             restored,
@@ -749,6 +792,7 @@ test "HISTORY encodes and restores an empty sequence" {
     const initial_first = terminal_screen.pages.getTopLeft(.screen).node;
     try decode(
         &decode_source,
+        try record.nextHeader(&decode_source),
         std.testing.allocator,
         .primary,
         &terminal_screen,
@@ -819,6 +863,7 @@ test "HISTORY rejects invalid routing and incomplete sequences" {
             case.expected,
             decode(
                 &source,
+                try record.nextHeader(&source),
                 std.testing.allocator,
                 .primary,
                 &terminal_screen,

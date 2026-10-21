@@ -43,8 +43,35 @@
 //! needs a new snapshot version instead.
 //!
 //! You rarely need to think about this when writing a record decoder.
-//! `Reader.init` reads headers with `nextHeader`, which does the skipping,
-//! so every decoder built on `Reader` skips unknown records automatically.
+//! `nextHeader` does the skipping, and every header is read through it.
+//!
+//! ## Decoding Records
+//!
+//! Decoding a record is a two-step job. The caller reads the record's
+//! header with `nextHeader`, then passes that header to the decoder for the
+//! record, such as `screen.decode` or `checkpoint.decode`. The decoder reads
+//! the payload that follows from the same source.
+//!
+//! ```zig
+//! // Read the header, skipping any unknown records before it.
+//! const header = try record.nextHeader(source);
+//!
+//! // Decode the record it belongs to.
+//! try checkpoint.decode(.ready, source, header);
+//! ```
+//!
+//! Splitting the work this way lets the caller look at the tag first. A
+//! caller that accepts several kinds of records in one position reads the
+//! header, switches on `header.tag`, and calls the matching decoder.
+//!
+//! A caller that expects exactly one kind of record can pass the header
+//! along without checking it. Every decoder checks the tag itself and
+//! returns `error.UnexpectedRecordTag` for a header of any other kind, so
+//! that check lives in one place.
+//!
+//! Decoders that are followed by a sequence of records, such as a SCREEN
+//! and its PAGE records, read the headers of the records in that sequence
+//! themselves. Only the first header comes from the caller.
 
 const std = @import("std");
 const assert = std.debug.assert;

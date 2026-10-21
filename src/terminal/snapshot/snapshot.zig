@@ -322,7 +322,12 @@ pub const Decoder = struct {
         // screen slots with their final routing. SCREEN values replace those
         // slots in place so ScreenSet pointers, including the active
         // pointer, stay valid.
-        var result = try terminal.decode(reader, io_, alloc);
+        var result = try terminal.decode(
+            reader,
+            try record.nextHeader(reader),
+            io_,
+            alloc,
+        );
         errdefer result.deinit(alloc);
 
         // TERMINAL initializes exactly the number of screen slots it
@@ -352,6 +357,7 @@ pub const Decoder = struct {
         for (0..screen_count) |_| {
             var decoded = try screen.decode(
                 reader,
+                try record.nextHeader(reader),
                 io_,
                 alloc,
                 screen_options,
@@ -374,6 +380,7 @@ pub const Decoder = struct {
         const decoded_continuation = try continuation.decode(
             alloc,
             reader,
+            try record.nextHeader(reader),
             options.max_continuation_bytes,
         );
         errdefer switch (decoded_continuation) {
@@ -382,7 +389,7 @@ pub const Decoder = struct {
         };
 
         // READY marks the exact envelope-through-CONTINUATION boundary.
-        try checkpoint.decode(.ready, self.source);
+        try checkpoint.decode(.ready, reader, try record.nextHeader(reader));
 
         // Record where history may be applied. The declared keys route the
         // HISTORY sequences, and the generations detect declared screens
@@ -424,7 +431,8 @@ pub const Decoder = struct {
     };
 
     /// Errors possible while decoding history records through FINISH.
-    pub const NextError = checkpoint.DecodeError ||
+    pub const NextError = record.NextHeaderError ||
+        checkpoint.DecodeError ||
         history.Decoder.InitError ||
         page.DiscardError ||
         page.DecodeError ||
@@ -499,10 +507,14 @@ pub const Decoder = struct {
                 state.current = null;
             }
 
+            // Read the next header before deciding how to decode the
+            // record. Unknown records before it were skipped.
+            const header = try record.nextHeader(self.source);
+
             // All sequences are consumed: FINISH ends the snapshot, leaving
             // trailing transport bytes unread.
             if (state.pending == 0) {
-                try checkpoint.decode(.finish, self.source);
+                try checkpoint.decode(.finish, self.source, header);
                 if (comptime build_options.slow_runtime_safety) {
                     var it = state.generations.iterator();
                     while (it.next()) |entry| {
@@ -521,7 +533,7 @@ pub const Decoder = struct {
             // may not repeat.
             state.pending -= 1;
             var manifest: history.Decoder = undefined;
-            try manifest.init(self.source);
+            try manifest.init(self.source, header);
             const key = manifest.header.key;
             if (state.generations.get(key) == null) {
                 return error.UnexpectedHistoryKey;
@@ -563,12 +575,13 @@ pub const Decoder = struct {
         };
 
         sequence.remaining -= 1;
+        const header = try record.nextHeader(self.source);
         const rows: usize = rows: {
             const restored = destination orelse {
                 // The record must still be consumed so decoding remains
                 // aligned with the following records and FINISH marker.
                 sequence.apply = false;
-                try page.discard(self.source);
+                try page.discard(self.source, header);
                 break :rows 0;
             };
             // The one-shot history decoder rejects a Screen which already has
@@ -579,6 +592,7 @@ pub const Decoder = struct {
             // its current scrollback limits.
             break :rows history.decodePage(
                 self.source,
+                header,
                 alloc,
                 restored,
                 state.page_options,
