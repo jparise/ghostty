@@ -645,71 +645,88 @@ pub fn Stream(comptime H: type) type {
 
         /// Process a string of characters.
         pub inline fn nextSlice(self: *Self, input: []const u8) void {
-            self.nextSliceUntracked(input);
+            self.nextSliceUntracked(input, false, {});
 
             // Continuation tracking is opt-in and this branch predicts
             // perfectly, so disabled streams pay nothing else here.
             if (self.continuation != null) self.trackContinuation(input);
         }
 
-        /// Process a string of characters, but only the shortest prefix
-        /// needed to reach the ground state.
+        /// Process input, stopping after the first byte that reaches any
+        /// boundary in `boundaries`. Null when the whole input was consumed
+        /// without reaching one. Handler actions run for the consumed prefix
+        /// only. The bytes consumed across any sequence of calls are exactly
+        /// the bytes the stream parsed, in order, and a second Stream fed
+        /// those bytes is in the same parser state at every reported boundary.
         ///
-        /// The ground state is when the stream isn't in the middle of any
-        /// type of sequence: UTF-8, ESC, CSI, OSC, etc. It is the stateless
-        /// point of the stream.
+        /// `.ground` is a state rather than a transition: if the stream is
+        /// already at ground this consumes nothing and reports a stop with
+        /// consumed = 0. Callers that loop must then feed the next bytes
+        /// without `.ground` in the set (or with `nextSlice`) to make
+        /// progress. Requesting ground costs 1% to 5% over `nextSlice`
+        /// because the stream must return at ground instead of staying in
+        /// the bulk loop. Requesting only string boundaries costs nothing
+        /// per byte: the checks sit at the handful of places that already
+        /// dispatch a string start or end, once per sequence.
         ///
-        /// If the stream is already at ground then this consumes nothing
-        /// and returns zero. A non-null return is the number of bytes consumed
-        /// before reaching ground, including the byte that reaches it. A null
-        /// return means the full slice was consumed without reaching ground.
-        ///
-        /// This is anywhere from 1% to 5% slower than nextSlice, depending
-        /// on the types of inputs provided (e.g. OSC vs APC, whether it
-        /// ever reaches ground, etc.).
-        pub inline fn nextSliceUntilGround(
+        /// Every check is behind the comptime `until` flag threaded through
+        /// the parsing functions, so `nextSlice` compiles to the same code
+        /// whether or not this is ever used.
+        pub inline fn nextSliceUntil(
             self: *Self,
             input: []const u8,
-        ) ?usize {
-            const consumed = self.nextSliceUntilGroundUntracked(input);
-            const consumed_len = consumed orelse input.len;
-            if (self.continuation != null and consumed_len > 0) {
-                self.trackContinuation(input[0..consumed_len]);
+            boundaries: Boundary.Set,
+        ) ?Boundary.Stop {
+            if (boundaries.contains(.ground) and self.ground()) return .{
+                .consumed = 0,
+                .reached = .initOne(.ground),
+            };
+
+            var u: Until = .{
+                .boundaries = boundaries,
+                .base = input.ptr,
+            };
+            self.nextSliceUntracked(input, true, &u);
+
+            const consumed = if (u.stop) |stop| stop.consumed else input.len;
+            if (self.continuation != null and consumed > 0) {
+                self.trackContinuation(input[0..consumed]);
             }
 
-            return consumed;
+            return u.stop;
         }
 
-        inline fn nextSliceUntilGroundUntracked(
+        /// In until mode, called after the byte just before `end` has been
+        /// fully processed. Completes the stop if that byte reached a
+        /// requested boundary (including ground, which is also checked
+        /// here) and returns true when the caller must return.
+        inline fn untilReached(self: *Self, u: *Until, end: [*]const u8) bool {
+            const at_ground = u.boundaries.contains(.ground) and self.ground();
+            if (u.stop == null and !at_ground) return false;
+            const stop = u.stopPtr();
+            stop.consumed = @intFromPtr(end) - @intFromPtr(u.base);
+            if (at_ground) stop.reached.insert(.ground);
+            return true;
+        }
+
+        inline fn nextSliceUntracked(
             self: *Self,
             input: []const u8,
-        ) ?usize {
-            if (self.ground()) return 0;
-
-            // Process UTF-8 if we're within that state.
-            var offset: usize = 0;
-            while (self.utf8decoder.state != 0) {
-                if (offset >= input.len) return null;
-                self.nextUtf8(input[offset]);
-                offset += 1;
-            }
-
-            // Process non-UTF-8
-            if (self.parser.state != .ground) {
-                offset += self.consumeUntilGround(input[offset..]);
-            }
-
-            return if (self.ground()) offset else null;
-        }
-
-        inline fn nextSliceUntracked(self: *Self, input: []const u8) void {
+            comptime until: bool,
+            u: Until.Arg(until),
+        ) void {
             // Byte-at-a-time parsing in debug mode only. Even without
             // SIMD support (build_options.simd == false, e.g. wasm), the
             // batched path below is much faster than per-byte dispatch
             // because it decodes UTF-8 in bulk (via scalar fallbacks) and
             // hands printable runs to the handler as print_slice actions.
             if (comptime debug) {
-                for (input) |c| self.nextUntracked(c);
+                for (input, 0..) |c, i| {
+                    self.nextUntracked(c, until, u);
+                    if (comptime until) {
+                        if (self.untilReached(u, input.ptr + i + 1)) return;
+                    }
+                }
                 return;
             }
 
@@ -722,7 +739,8 @@ pub fn Stream(comptime H: type) type {
             var i: usize = 0;
             while (true) {
                 const len = @min(cp_buf.len, input.len - i);
-                self.nextSliceCapped(input[i .. i + len], &cp_buf);
+                self.nextSliceCapped(input[i .. i + len], &cp_buf, until, u);
+                if (comptime until) if (u.stop != null) return;
                 i += len;
                 if (i >= input.len) break;
             }
@@ -732,6 +750,8 @@ pub fn Stream(comptime H: type) type {
             self: *Self,
             input: []const u8,
             cp_buf: []u32,
+            comptime until: bool,
+            u: Until.Arg(until),
         ) void {
             assert(input.len <= cp_buf.len);
 
@@ -744,14 +764,18 @@ pub fn Stream(comptime H: type) type {
                 self.nextUtf8(input[offset]);
                 offset += 1;
             }
+            // Completing the codepoint may have reached ground.
+            if (comptime until) if (self.untilReached(u, input.ptr + offset)) return;
             if (offset >= input.len) return;
 
             // If we're not in the ground state then we process until
             // we are. This can happen if the last chunk of input put us
             // in the middle of a control sequence.
-            offset += self.consumeUntilGround(input[offset..]);
+            offset += self.consumeUntilGround(input[offset..], until, u);
+            if (comptime until) if (self.untilReached(u, input.ptr + offset)) return;
             if (offset >= input.len) return;
-            offset += self.consumeAllEscapes(input[offset..]);
+            offset += self.consumeAllEscapes(input[offset..], until, u);
+            if (comptime until) if (self.untilReached(u, input.ptr + offset)) return;
 
             // If we're in the ground state then we can use SIMD to process
             // input until we see an ESC (0x1B), since all other characters
@@ -835,7 +859,8 @@ pub fn Stream(comptime H: type) type {
                 }
 
                 // Process control sequences until we run out.
-                offset += self.consumeAllEscapes(input[offset..]);
+                offset += self.consumeAllEscapes(input[offset..], until, u);
+                if (comptime until) if (self.untilReached(u, input.ptr + offset)) return;
             }
         }
 
@@ -844,13 +869,19 @@ pub fn Stream(comptime H: type) type {
         ///
         /// Expects input to start with 0x1B, use consumeUntilGround first
         /// if the stream may be in the middle of an escape sequence.
-        inline fn consumeAllEscapes(self: *Self, input: []const u8) usize {
+        inline fn consumeAllEscapes(
+            self: *Self,
+            input: []const u8,
+            comptime until: bool,
+            u: Until.Arg(until),
+        ) usize {
             var offset: usize = 0;
             while (input[offset] == 0x1B) {
                 self.parser.state = .escape;
                 self.parser.clear();
                 offset += 1;
-                offset += self.consumeUntilGround(input[offset..]);
+                offset += self.consumeUntilGround(input[offset..], until, u);
+                if (comptime until) if (self.untilReached(u, input.ptr + offset)) return offset;
                 if (offset >= input.len) return input.len;
             }
             return offset;
@@ -858,7 +889,12 @@ pub fn Stream(comptime H: type) type {
 
         /// Parses escape sequences until the parser reaches the ground state.
         /// Returns the number of bytes consumed from the provided input.
-        inline fn consumeUntilGround(self: *Self, input: []const u8) usize {
+        inline fn consumeUntilGround(
+            self: *Self,
+            input: []const u8,
+            comptime until: bool,
+            u: Until.Arg(until),
+        ) usize {
             var offset: usize = 0;
             while (self.parser.state != .ground) {
                 if (offset >= input.len) return input.len;
@@ -910,12 +946,24 @@ pub fn Stream(comptime H: type) type {
                                 self.parser.clear();
                                 self.parser.state = .escape;
                                 self.handler.vt(.apc_end, .{ .terminated = true });
+                                if (comptime until) {
+                                    u.apcEnd(input[offset]);
+                                    offset += 1;
+                                    if (self.untilReached(u, input.ptr + offset)) return offset;
+                                    continue;
+                                }
                                 offset += 1;
                                 continue;
                             },
                             0x9C => {
                                 self.parser.state = .ground;
                                 self.handler.vt(.apc_end, .{ .terminated = true });
+                                if (comptime until) {
+                                    u.apcEnd(input[offset]);
+                                    offset += 1;
+                                    if (self.untilReached(u, input.ptr + offset)) return offset;
+                                    continue;
+                                }
                                 offset += 1;
                                 continue;
                             },
@@ -968,8 +1016,9 @@ pub fn Stream(comptime H: type) type {
                     }
                 }
 
-                self.nextNonUtf8(input[offset]);
+                self.nextNonUtf8(input[offset], until, u);
                 offset += 1;
+                if (comptime until) if (self.untilReached(u, input.ptr + offset)) return offset;
             }
             return offset;
         }
@@ -1161,18 +1210,23 @@ pub fn Stream(comptime H: type) type {
         /// operation that can't use SIMD. Prefer nextSlice if you can and
         /// try to get multiple bytes at once.
         pub inline fn next(self: *Self, c: u8) void {
-            self.nextUntracked(c);
+            self.nextUntracked(c, false, {});
             if (self.continuation != null) self.trackContinuation(&.{c});
         }
 
-        inline fn nextUntracked(self: *Self, c: u8) void {
+        inline fn nextUntracked(
+            self: *Self,
+            c: u8,
+            comptime until: bool,
+            u: Until.Arg(until),
+        ) void {
             // The scalar path can be responsible for decoding UTF-8.
             if (self.parser.state == .ground) {
                 self.nextUtf8(c);
                 return;
             }
 
-            self.nextNonUtf8(c);
+            self.nextNonUtf8(c, until, u);
         }
 
         /// Process the next byte and print as necessary.
@@ -1248,7 +1302,12 @@ pub fn Stream(comptime H: type) type {
         ///
         /// This assumes that we're not in the UTF-8 decoding state. If
         /// we may be in the UTF-8 decoding state call nextSlice or next.
-        fn nextNonUtf8(self: *Self, c: u8) void {
+        fn nextNonUtf8(
+            self: *Self,
+            c: u8,
+            comptime until: bool,
+            u: Until.Arg(until),
+        ) void {
             assert(self.parser.state != .ground);
 
             // Fast path for CSI entry.
@@ -1330,6 +1389,15 @@ pub fn Stream(comptime H: type) type {
             for (actions) |action_opt| {
                 const action = action_opt orelse continue;
                 if (comptime debug) log.info("action: {f}", .{action});
+
+                // String boundaries are parser state transitions, so
+                // they are noted before a handler gets to skip the
+                // action through vtRaw.
+                if (comptime until) switch (action) {
+                    .apc_start => u.apcStart(c),
+                    .apc_end => u.apcEnd(c),
+                    else => {},
+                };
 
                 // A handler can expose this to get the raw action before
                 // it is further parsed. If this returns `true` then we skip
@@ -3159,6 +3227,153 @@ pub fn Stream(comptime H: type) type {
         }
     };
 }
+
+/// A point in the byte stream at which `Stream.nextSliceUntil` can stop.
+///
+/// The stream reaches a boundary on exactly one byte and reports it
+/// through `Stop` without parsing that byte twice, so an embedder can
+/// learn a sequence's extent from the same parse that handled it.
+pub const Boundary = enum {
+    /// Not inside any sequence or UTF-8 codepoint. A state, not a
+    /// transition: when already at ground the call consumes nothing
+    /// and reports a stop with consumed = 0.
+    ground,
+
+    /// The byte that entered the APC string state. Also SOS and PM:
+    /// the table has one state for all three and the terminal feeds
+    /// all three to its APC handler.
+    apc_start,
+
+    /// The byte that left the APC string state.
+    apc_end,
+
+    // Reserved, not done: dcs_start, dcs_end, osc_start, osc_end.
+
+    /// A set of Boundary values so an embedder can subscribe to multiple.
+    pub const Set = std.EnumSet(Boundary);
+    pub const StringKind = enum(u8) { apc, dcs, osc };
+
+    pub const Introducer = enum(u8) {
+        /// ESC then the final ('_', 'X', '^'). consumed covers only
+        /// the final; the ESC may have been consumed by an earlier call.
+        esc,
+
+        /// One C1 byte (0x9F, 0x98, 0x9E).
+        c1,
+    };
+
+    pub const EndReason = enum(u8) {
+        /// ESC. The next byte is not consumed; it is dispatched as an
+        /// ordinary escape on the next call.
+        st_esc,
+
+        /// 0x9C.
+        st_c1,
+
+        /// CAN or SUB.
+        cancelled,
+
+        /// Another C1 byte: execute, or switch to CSI/DCS/OSC.
+        aborted,
+
+        /// True when the string ended with a string terminator. This
+        /// is the same flag the stream hands the handler's `apc_end`.
+        pub fn terminated(self: EndReason) bool {
+            return switch (self) {
+                .st_esc, .st_c1 => true,
+                .cancelled, .aborted => false,
+            };
+        }
+    };
+
+    pub const Stop = struct {
+        /// Includes the byte that reached the boundary.
+        consumed: usize,
+
+        /// Every requested boundary that byte reached. Two bits when a
+        /// string end also reaches ground (CAN, SUB, 0x9C). A C1 string
+        /// introducer inside a string (0x98, 0x9E, 0x9F) is a no-op
+        /// self-transition in the parser, so it never reports an end
+        /// and a start together.
+        reached: Set,
+        start: ?Start = null,
+        end: ?End = null,
+
+        pub const Start = struct {
+            kind: StringKind,
+            introducer: Introducer,
+            byte: u8,
+        };
+
+        pub const End = struct {
+            kind: StringKind,
+            reason: EndReason,
+            byte: u8,
+        };
+    };
+};
+
+/// Scratch state for `Stream.nextSliceUntil`. The parsing functions take
+/// a `comptime until: bool` and an `Until.Arg(until)`, which is one of
+/// these in until mode and `void` otherwise, so the plain `nextSlice`
+/// instantiation contains none of the boundary checks.
+const Until = struct {
+    /// The boundaries the caller asked to stop at.
+    boundaries: Boundary.Set,
+
+    /// The start of the full input. Every parsing function sees a
+    /// subslice of it, so the byte that reaches a boundary is turned
+    /// into a consumed count from its address, without threading
+    /// offsets back up through every return value.
+    base: [*]const u8,
+
+    /// The stop being built. Null until a byte reaches a boundary.
+    stop: ?Boundary.Stop = null,
+
+    /// Note that `c` entered the APC string state.
+    fn apcStart(self: *Until, c: u8) void {
+        if (!self.boundaries.contains(.apc_start)) return;
+        const stop = self.stopPtr();
+        stop.reached.insert(.apc_start);
+        stop.start = .{
+            .kind = .apc,
+            .introducer = if (c >= 0x80) .c1 else .esc,
+            .byte = c,
+        };
+    }
+
+    /// Note that `c` left the APC string state.
+    fn apcEnd(self: *Until, c: u8) void {
+        if (!self.boundaries.contains(.apc_end)) return;
+        const stop = self.stopPtr();
+        stop.reached.insert(.apc_end);
+        stop.end = .{
+            .kind = .apc,
+            .reason = switch (c) {
+                0x18, 0x1A => .cancelled,
+                0x1B => .st_esc,
+                0x9C => .st_c1,
+                else => .aborted,
+            },
+            .byte = c,
+        };
+    }
+
+    fn stopPtr(self: *Until) *Boundary.Stop {
+        if (self.stop == null) self.stop = .{
+            .consumed = 0,
+            .reached = .empty,
+        };
+        return &self.stop.?;
+    }
+
+    /// The parameter type the parsing functions take for a given
+    /// `comptime until: bool`: a pointer to this in until mode and
+    /// `void` otherwise.
+    fn Arg(comptime until: bool) type {
+        return if (until) *Until else void;
+    }
+};
 
 /// Logs an unsupported-input message at most once per distinct key
 /// per process.
@@ -5074,7 +5289,17 @@ const ContinuationNullHandler = struct {
     ) void {}
 };
 
-test "stream: nextSliceUntilGround stops at the earliest boundary" {
+/// Test helper: the ground-only form of nextSliceUntil, returning the
+/// consumed count the way the former nextSliceUntilGround did.
+fn untilGround(stream: anytype, input: []const u8) !?usize {
+    const stop = stream.nextSliceUntil(input, .initOne(.ground)) orelse return null;
+    try testing.expect(stop.reached.eql(.initOne(.ground)));
+    try testing.expect(stop.start == null);
+    try testing.expect(stop.end == null);
+    return stop.consumed;
+}
+
+test "stream: nextSliceUntil ground stops at the earliest boundary" {
     const S = Stream(ContinuationTestHandler);
     var stream: S = .init(.{ .handler = .{} });
     defer stream.deinit();
@@ -5084,7 +5309,7 @@ test "stream: nextSliceUntilGround stops at the earliest boundary" {
     stream.handler.committed = 0;
 
     const input = "mABC\x1b[";
-    const consumed = stream.nextSliceUntilGround(input).?;
+    const consumed = (try untilGround(&stream, input)).?;
     try testing.expectEqual(@as(usize, 1), consumed);
     try testing.expect(stream.ground());
     try testing.expectEqual(@as(usize, 1), stream.handler.committed);
@@ -5097,21 +5322,21 @@ test "stream: nextSliceUntilGround stops at the earliest boundary" {
     try testing.expectEqual(@as(usize, 4), stream.handler.committed);
 }
 
-test "stream: nextSliceUntilGround consumes all input without a boundary" {
+test "stream: nextSliceUntil ground consumes all input without a boundary" {
     const S = Stream(ContinuationNullHandler);
     var stream: S = .init(.{ .handler = .{} });
     defer stream.deinit();
 
     try testing.expectEqual(
         @as(?usize, 0),
-        stream.nextSliceUntilGround("unprocessed"),
+        try untilGround(&stream, "unprocessed"),
     );
     try testing.expect(stream.ground());
 
     stream.nextSlice("\x1b[");
     try testing.expectEqual(
         @as(?usize, null),
-        stream.nextSliceUntilGround("123"),
+        try untilGround(&stream, "123"),
     );
     try testing.expect(!stream.ground());
 
@@ -5119,12 +5344,12 @@ test "stream: nextSliceUntilGround consumes all input without a boundary" {
     // input while still pending.
     try testing.expectEqual(
         @as(?usize, 1),
-        stream.nextSliceUntilGround("m"),
+        try untilGround(&stream, "m"),
     );
     try testing.expect(stream.ground());
 }
 
-test "stream: nextSliceUntilGround handles UTF-8 boundaries" {
+test "stream: nextSliceUntil ground handles UTF-8 boundaries" {
     const S = Stream(ContinuationTestHandler);
 
     // A completed codepoint is committed synchronously, and the printable
@@ -5135,7 +5360,7 @@ test "stream: nextSliceUntilGround handles UTF-8 boundaries" {
     const valid_input = [_]u8{ 0x9F, 0x98, 0x84, 'X' };
     try testing.expectEqual(
         @as(?usize, 3),
-        valid.nextSliceUntilGround(&valid_input),
+        try untilGround(&valid, &valid_input),
     );
     try testing.expect(valid.ground());
     try testing.expectEqual(@as(usize, 1), valid.handler.committed);
@@ -5147,7 +5372,7 @@ test "stream: nextSliceUntilGround handles UTF-8 boundaries" {
     malformed.nextSlice(&.{ 0xE0, 0xA0 });
     try testing.expectEqual(
         @as(?usize, 1),
-        malformed.nextSliceUntilGround("A!"),
+        try untilGround(&malformed, "A!"),
     );
     try testing.expect(malformed.ground());
     try testing.expectEqual(@as(usize, 2), malformed.handler.committed);
@@ -5159,12 +5384,12 @@ test "stream: nextSliceUntilGround handles UTF-8 boundaries" {
     retry_escape.nextSlice(&.{ 0xE0, 0xA0 });
     try testing.expectEqual(
         @as(?usize, 3),
-        retry_escape.nextSliceUntilGround("\x1b[mX"),
+        try untilGround(&retry_escape, "\x1b[mX"),
     );
     try testing.expect(retry_escape.ground());
 }
 
-test "stream: nextSliceUntilGround handles aborts and bulk strings" {
+test "stream: nextSliceUntil ground handles aborts and bulk strings" {
     const S = Stream(ContinuationTestHandler);
 
     var aborted: S = .init(.{ .handler = .{} });
@@ -5172,7 +5397,7 @@ test "stream: nextSliceUntilGround handles aborts and bulk strings" {
     aborted.nextSlice("\x1b[123");
     try testing.expectEqual(
         @as(?usize, 1),
-        aborted.nextSliceUntilGround(&.{ 0x18, 'X' }),
+        try untilGround(&aborted, &.{ 0x18, 'X' }),
     );
     try testing.expect(aborted.ground());
 
@@ -5185,12 +5410,12 @@ test "stream: nextSliceUntilGround handles aborts and bulk strings" {
     input[130] = 'X';
     try testing.expectEqual(
         @as(?usize, 130),
-        apc.nextSliceUntilGround(&input),
+        try untilGround(&apc, &input),
     );
     try testing.expect(apc.ground());
 }
 
-test "stream: nextSliceUntilGround tracks only the consumed prefix" {
+test "stream: nextSliceUntil ground tracks only the consumed prefix" {
     const S = Stream(ContinuationNullHandler);
     var stream: S = .init(.{
         .allocator = testing.allocator,
@@ -5202,7 +5427,7 @@ test "stream: nextSliceUntilGround tracks only the consumed prefix" {
     stream.nextSlice("\x1b[31");
     try testing.expectEqual(
         @as(?usize, 1),
-        stream.nextSliceUntilGround("mX\x1b["),
+        try untilGround(&stream, "mX\x1b["),
     );
 
     var buf: [64]u8 = undefined;
@@ -5213,11 +5438,636 @@ test "stream: nextSliceUntilGround tracks only the consumed prefix" {
     stream.nextSlice("\x1b[");
     try testing.expectEqual(
         @as(?usize, null),
-        stream.nextSliceUntilGround("123"),
+        try untilGround(&stream, "123"),
     );
     var pending_writer: std.Io.Writer = .fixed(&buf);
     try stream.writeContinuation(&pending_writer);
     try testing.expectEqualStrings("\x1b[123", pending_writer.buffered());
+}
+
+/// A test handler for boundary stops: records APC lifecycle, content,
+/// and how many codepoints were printed.
+const BoundaryTestHandler = struct {
+    started: usize = 0,
+    ended: usize = 0,
+    last_terminated: ?bool = null,
+    buf: [512]u8 = undefined,
+    len: usize = 0,
+    prints: usize = 0,
+
+    pub fn deinit(_: *@This()) void {}
+
+    pub fn vt(
+        self: *@This(),
+        comptime action: Action.Tag,
+        value: Action.Value(action),
+    ) void {
+        switch (action) {
+            .apc_start => self.started += 1,
+            .apc_end => {
+                self.ended += 1;
+                self.last_terminated = value.terminated;
+            },
+            .apc_put => {
+                self.buf[self.len] = value;
+                self.len += 1;
+            },
+            .apc_put_slice => {
+                @memcpy(self.buf[self.len..][0..value.bytes.len], value.bytes);
+                self.len += value.bytes.len;
+            },
+            .print => self.prints += 1,
+            .print_slice => self.prints += value.cps.len,
+            else => {},
+        }
+    }
+};
+
+/// Same as BoundaryTestHandler but with a vtRaw hook, which disables
+/// every bulk fast path so every byte goes through Parser.next.
+const BoundaryRawTestHandler = struct {
+    inner: BoundaryTestHandler = .{},
+
+    pub fn deinit(_: *@This()) void {}
+
+    pub fn vtRaw(_: *@This(), _: Parser.Action) !bool {
+        return false;
+    }
+
+    pub fn vt(
+        self: *@This(),
+        comptime action: Action.Tag,
+        value: Action.Value(action),
+    ) void {
+        self.inner.vt(action, value);
+    }
+};
+
+fn boundaryHandler(stream: anytype) *BoundaryTestHandler {
+    return switch (@TypeOf(stream.handler)) {
+        BoundaryTestHandler => &stream.handler,
+        BoundaryRawTestHandler => &stream.handler.inner,
+        else => unreachable,
+    };
+}
+
+const apc_end_set: Boundary.Set = .initOne(.apc_end);
+const apc_start_set: Boundary.Set = .initOne(.apc_start);
+const apc_set: Boundary.Set = .initMany(&.{ .apc_start, .apc_end });
+const all_set: Boundary.Set = .initMany(&.{ .ground, .apc_start, .apc_end });
+
+/// Expected result of feeding one byte to a stream inside an APC.
+const ApcExit = struct {
+    reason: ?Boundary.EndReason,
+    state: Parser.State,
+};
+
+fn expectedApcExit(c: u8) ApcExit {
+    return switch (c) {
+        0x18, 0x1A => .{ .reason = .cancelled, .state = .ground },
+        0x1B => .{ .reason = .st_esc, .state = .escape },
+        0x9C => .{ .reason = .st_c1, .state = .ground },
+        0x90 => .{ .reason = .aborted, .state = .dcs_entry },
+        0x9B => .{ .reason = .aborted, .state = .csi_entry },
+        0x9D => .{ .reason = .aborted, .state = .osc_string },
+        // A string introducer inside a string is a self-transition
+        // in the parser: no exit, no entry, the byte is dropped.
+        0x98, 0x9E, 0x9F => .{ .reason = null, .state = .sos_pm_apc_string },
+        0x80...0x8F, 0x91...0x97, 0x99, 0x9A => .{ .reason = .aborted, .state = .ground },
+        // Ignored by the table: not data, not an exit.
+        0xA0...0xFF => .{ .reason = null, .state = .sos_pm_apc_string },
+        // Everything else is data.
+        else => .{ .reason = null, .state = .sos_pm_apc_string },
+    };
+}
+
+fn testApcExits(comptime H: type) !void {
+    const S = Stream(H);
+    var c: u8 = 0;
+    while (true) : (c += 1) {
+        const expected = expectedApcExit(c);
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        s.nextSlice("\x1b_Gab");
+        try testing.expectEqual(Parser.State.sos_pm_apc_string, s.parser.state);
+        const h = boundaryHandler(&s);
+        try testing.expectEqual(@as(usize, 1), h.started);
+        try testing.expectEqualStrings("Gab", h.buf[0..h.len]);
+
+        const input = [_]u8{c};
+        const stop_ = s.nextSliceUntil(&input, apc_end_set);
+        try testing.expectEqual(expected.state, s.parser.state);
+
+        if (expected.reason) |reason| {
+            const stop = stop_ orelse return error.ExpectedStop;
+            try testing.expectEqual(@as(usize, 1), stop.consumed);
+            try testing.expect(stop.reached.eql(apc_end_set));
+            try testing.expect(stop.start == null);
+            const end = stop.end orelse return error.ExpectedEnd;
+            try testing.expectEqual(Boundary.StringKind.apc, end.kind);
+            try testing.expectEqual(reason, end.reason);
+            try testing.expectEqual(c, end.byte);
+            try testing.expectEqual(@as(usize, 1), h.ended);
+            try testing.expectEqual(reason.terminated(), h.last_terminated.?);
+        } else {
+            try testing.expectEqual(@as(?Boundary.Stop, null), stop_);
+            try testing.expectEqual(@as(usize, 0), h.ended);
+            // 0x7F and C0 bytes are data; the rest are dropped.
+            const data = switch (c) {
+                0x00...0x17, 0x19, 0x1C...0x7F => true,
+                else => false,
+            };
+            try testing.expectEqualStrings(
+                if (data) "Gab" ++ [_]u8{c} else "Gab",
+                h.buf[0..h.len],
+            );
+        }
+
+        if (c == 0xFF) break;
+    }
+}
+
+test "stream: nextSliceUntil every apc exit" {
+    try testApcExits(BoundaryTestHandler);
+}
+
+test "stream: nextSliceUntil every apc exit through the scalar path" {
+    try testApcExits(BoundaryRawTestHandler);
+}
+
+test "stream: nextSliceUntil apc st_esc leaves the next byte for the next call" {
+    const S = Stream(BoundaryTestHandler);
+
+    // A full ST: the backslash is an ordinary escape on the next call.
+    {
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        s.nextSlice("\x1b_Gab");
+        const stop = s.nextSliceUntil("\x1b\\x", apc_end_set).?;
+        try testing.expectEqual(@as(usize, 1), stop.consumed);
+        try testing.expectEqual(Boundary.EndReason.st_esc, stop.end.?.reason);
+        try testing.expectEqual(Parser.State.escape, s.parser.state);
+        try testing.expectEqual(@as(?Boundary.Stop, null), s.nextSliceUntil("\\x", apc_end_set));
+        try testing.expect(s.ground());
+        try testing.expectEqual(@as(usize, 1), s.handler.prints);
+        try testing.expectEqualStrings("Gab", s.handler.buf[0..s.handler.len]);
+    }
+
+    // ESC then another byte: the string still ended at the ESC and the
+    // byte after it is dispatched as that escape sequence.
+    {
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        s.nextSlice("\x1b_Gab");
+        const stop = s.nextSliceUntil("\x1b[1mx", apc_end_set).?;
+        try testing.expectEqual(@as(usize, 1), stop.consumed);
+        try testing.expectEqual(Boundary.EndReason.st_esc, stop.end.?.reason);
+        try testing.expectEqual(@as(usize, 1), s.handler.ended);
+        try testing.expect(s.handler.last_terminated.?);
+        try testing.expectEqual(@as(?Boundary.Stop, null), s.nextSliceUntil("[1mx", apc_end_set));
+        try testing.expect(s.ground());
+        try testing.expectEqual(@as(usize, 1), s.handler.prints);
+    }
+}
+
+test "stream: nextSliceUntil apc introducers" {
+    const S = Stream(BoundaryTestHandler);
+
+    // ESC introducers from ground, ESC and final in one call.
+    for ([_]u8{ '_', 'X', '^' }) |final| {
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        const input = [_]u8{ 0x1B, final, 'G' };
+        const stop = s.nextSliceUntil(&input, apc_start_set).?;
+        try testing.expectEqual(@as(usize, 2), stop.consumed);
+        try testing.expect(stop.reached.eql(apc_start_set));
+        try testing.expect(stop.end == null);
+        const start = stop.start.?;
+        try testing.expectEqual(Boundary.StringKind.apc, start.kind);
+        try testing.expectEqual(Boundary.Introducer.esc, start.introducer);
+        try testing.expectEqual(final, start.byte);
+        try testing.expectEqual(Parser.State.sos_pm_apc_string, s.parser.state);
+        try testing.expectEqual(@as(usize, 1), s.handler.started);
+        // The first byte after the introducer is the first byte of
+        // content and has not been consumed.
+        try testing.expectEqual(@as(usize, 0), s.handler.len);
+    }
+
+    // ESC consumed by an earlier call: consumed covers only the final.
+    {
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        try testing.expectEqual(@as(?Boundary.Stop, null), s.nextSliceUntil("\x1b", apc_start_set));
+        const stop = s.nextSliceUntil("_G", apc_start_set).?;
+        try testing.expectEqual(@as(usize, 1), stop.consumed);
+        try testing.expectEqual(Boundary.Introducer.esc, stop.start.?.introducer);
+        try testing.expectEqual(@as(u8, '_'), stop.start.?.byte);
+    }
+
+    // C1 introducers from non-ground states. At ground a raw C1 byte
+    // goes through the UTF-8 decoder instead, so prime with a CSI
+    // (the csi_param fast path) and with a bare ESC (Parser.next).
+    for ([_]u8{ 0x98, 0x9E, 0x9F }) |c1| {
+        for ([_][]const u8{ "\x1b[1", "\x1b" }) |prime| {
+            var s: S = .init(.{ .handler = .{} });
+            defer s.deinit();
+            s.nextSlice(prime);
+            try testing.expect(!s.ground());
+            const input = [_]u8{ c1, 'G' };
+            const stop = s.nextSliceUntil(&input, apc_start_set).?;
+            try testing.expectEqual(@as(usize, 1), stop.consumed);
+            try testing.expect(stop.reached.eql(apc_start_set));
+            const start = stop.start.?;
+            try testing.expectEqual(Boundary.StringKind.apc, start.kind);
+            try testing.expectEqual(Boundary.Introducer.c1, start.introducer);
+            try testing.expectEqual(c1, start.byte);
+            try testing.expectEqual(Parser.State.sos_pm_apc_string, s.parser.state);
+            try testing.expectEqual(@as(usize, 1), s.handler.started);
+        }
+    }
+}
+
+/// One stop as seen by a caller looping over nextSliceUntil, with
+/// consumed made absolute within the whole input.
+const AbsoluteStop = struct {
+    end: usize,
+    reached: Boundary.Set,
+    start: ?Boundary.Stop.Start,
+    end_info: ?Boundary.Stop.End,
+};
+
+/// Feed input through nextSliceUntil in a loop, recording every stop
+/// at its absolute offset. When ground is in the set and the stream is
+/// at ground, it is dropped for that call so the loop makes progress.
+fn collectStops(
+    stream: anytype,
+    input: []const u8,
+    base: usize,
+    set: Boundary.Set,
+    out: *std.ArrayList(AbsoluteStop),
+) !void {
+    var rem = input;
+    while (rem.len > 0) {
+        var call_set = set;
+        if (stream.ground()) call_set.remove(.ground);
+        const stop = stream.nextSliceUntil(rem, call_set) orelse break;
+        try testing.expect(stop.consumed > 0);
+        try testing.expect(stop.consumed <= rem.len);
+        try out.append(testing.allocator, .{
+            .end = base + (input.len - rem.len) + stop.consumed,
+            .reached = stop.reached,
+            .start = stop.start,
+            .end_info = stop.end,
+        });
+        rem = rem[stop.consumed..];
+    }
+}
+
+test "stream: nextSliceUntil stops do not depend on the split" {
+    const S = Stream(BoundaryTestHandler);
+    const input = "\x1b_Gf=100\x1b\\";
+
+    // Reference: one call.
+    var reference: std.ArrayList(AbsoluteStop) = .empty;
+    defer reference.deinit(testing.allocator);
+    {
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        try collectStops(&s, input, 0, apc_set, &reference);
+        try testing.expect(s.ground());
+    }
+    try testing.expectEqual(@as(usize, 2), reference.items.len);
+    try testing.expectEqual(@as(usize, 2), reference.items[0].end);
+    try testing.expect(reference.items[0].reached.eql(apc_start_set));
+    try testing.expectEqual(@as(u8, '_'), reference.items[0].start.?.byte);
+    try testing.expectEqual(@as(usize, 9), reference.items[1].end);
+    try testing.expect(reference.items[1].reached.eql(apc_end_set));
+    try testing.expectEqual(Boundary.EndReason.st_esc, reference.items[1].end_info.?.reason);
+
+    // Every split point, including between ESC and '_' (0..1) and
+    // between the terminating ESC and the backslash (0..9).
+    for (0..input.len + 1) |split| {
+        var stops: std.ArrayList(AbsoluteStop) = .empty;
+        defer stops.deinit(testing.allocator);
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        try collectStops(&s, input[0..split], 0, apc_set, &stops);
+        try collectStops(&s, input[split..], split, apc_set, &stops);
+        try testing.expect(s.ground());
+        try testing.expectEqualDeep(reference.items, stops.items);
+        try testing.expectEqual(@as(usize, 1), s.handler.started);
+        try testing.expectEqual(@as(usize, 1), s.handler.ended);
+        try testing.expectEqualStrings("Gf=100", s.handler.buf[0..s.handler.len]);
+    }
+}
+
+test "stream: nextSliceUntil C1 introducer inside an apc is dropped" {
+    // The parser treats 0x98, 0x9E, 0x9F inside a string as a
+    // self-transition: no apc_end, no apc_start, and the byte is not
+    // data. So this does not restart the string and reports nothing.
+    const S = Stream(BoundaryTestHandler);
+    var s: S = .init(.{ .handler = .{} });
+    defer s.deinit();
+    const input = "\x1b_a\x9fb\x1b\\";
+    var stops: std.ArrayList(AbsoluteStop) = .empty;
+    defer stops.deinit(testing.allocator);
+    try collectStops(&s, input, 0, apc_set, &stops);
+    try testing.expectEqual(@as(usize, 2), stops.items.len);
+    try testing.expectEqual(@as(usize, 2), stops.items[0].end);
+    try testing.expect(stops.items[0].reached.eql(apc_start_set));
+    try testing.expectEqual(@as(usize, 6), stops.items[1].end);
+    try testing.expect(stops.items[1].reached.eql(apc_end_set));
+    try testing.expectEqual(@as(usize, 1), s.handler.started);
+    try testing.expectEqual(@as(usize, 1), s.handler.ended);
+    try testing.expectEqualStrings("ab", s.handler.buf[0..s.handler.len]);
+}
+
+test "stream: nextSliceUntil combined ground and apc end" {
+    const S = Stream(BoundaryTestHandler);
+    const set: Boundary.Set = .initMany(&.{ .ground, .apc_end });
+
+    // CAN ends the string and reaches ground on the same byte.
+    {
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        s.nextSlice("\x1b_Gab");
+        const stop = s.nextSliceUntil("\x18x", set).?;
+        try testing.expectEqual(@as(usize, 1), stop.consumed);
+        try testing.expect(stop.reached.eql(set));
+        try testing.expectEqual(Boundary.EndReason.cancelled, stop.end.?.reason);
+        try testing.expect(s.ground());
+    }
+
+    // 0x9C too.
+    {
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        s.nextSlice("\x1b_Gab");
+        const stop = s.nextSliceUntil("\x9cx", set).?;
+        try testing.expectEqual(@as(usize, 1), stop.consumed);
+        try testing.expect(stop.reached.eql(set));
+        try testing.expectEqual(Boundary.EndReason.st_c1, stop.end.?.reason);
+        try testing.expect(s.ground());
+    }
+
+    // ESC ends the string but ground is only reached on the backslash.
+    {
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        s.nextSlice("\x1b_Gab");
+        const stop = s.nextSliceUntil("\x1b\\x", set).?;
+        try testing.expectEqual(@as(usize, 1), stop.consumed);
+        try testing.expect(stop.reached.eql(apc_end_set));
+        try testing.expectEqual(Boundary.EndReason.st_esc, stop.end.?.reason);
+        try testing.expect(!s.ground());
+
+        const ground_stop = s.nextSliceUntil("\\x", set).?;
+        try testing.expectEqual(@as(usize, 1), ground_stop.consumed);
+        try testing.expect(ground_stop.reached.eql(.initOne(.ground)));
+        try testing.expect(ground_stop.end == null);
+        try testing.expect(s.ground());
+
+        // Already at ground: a stop with nothing consumed.
+        const idle = s.nextSliceUntil("x", set).?;
+        try testing.expectEqual(@as(usize, 0), idle.consumed);
+        try testing.expect(idle.reached.eql(.initOne(.ground)));
+        try testing.expectEqual(@as(usize, 0), s.handler.prints);
+    }
+}
+
+test "stream: nextSliceUntil apc start with ground requested" {
+    // From ground, the start of an APC is the first boundary reached:
+    // ESC leaves ground, '_' enters the string.
+    const S = Stream(BoundaryTestHandler);
+    var s: S = .init(.{ .handler = .{} });
+    defer s.deinit();
+    const stop = s.nextSliceUntil("\x1b_Gab\x1b\\", apc_set).?;
+    try testing.expectEqual(@as(usize, 2), stop.consumed);
+    try testing.expect(stop.reached.eql(apc_start_set));
+
+    // Ground is reached before the next APC, so with ground requested
+    // the stop lands on the backslash of the ST.
+    const end = s.nextSliceUntil("Gab\x1b\\\x1b_x", all_set).?;
+    try testing.expectEqual(@as(usize, 4), end.consumed);
+    try testing.expect(end.reached.eql(apc_end_set));
+    const ground = s.nextSliceUntil("\\\x1b_x", all_set).?;
+    try testing.expectEqual(@as(usize, 1), ground.consumed);
+    try testing.expect(ground.reached.eql(.initOne(.ground)));
+}
+
+/// Hashes every handler action in a chunking-independent way: bulk
+/// actions are flattened to their per-element form so two streams fed
+/// the same bytes in different pieces hash the same.
+const DifferentialHandler = struct {
+    hasher: std.hash.Wyhash = .init(0),
+    actions: usize = 0,
+
+    pub fn deinit(_: *@This()) void {}
+
+    pub fn vt(
+        self: *@This(),
+        comptime action: Action.Tag,
+        value: Action.Value(action),
+    ) void {
+        switch (action) {
+            .print_slice => for (value.cps) |cp| self.record(.print, @as(u32, cp)),
+            .print => self.record(.print, @as(u32, value.cp)),
+            .apc_put_slice => for (value.bytes) |b| self.record(.apc_put, b),
+            else => self.record(action, value),
+        }
+    }
+
+    fn record(self: *@This(), comptime tag: Action.Tag, value: anytype) void {
+        self.actions += 1;
+        self.hasher.update(@tagName(tag));
+        std.hash.autoHashStrat(&self.hasher, value, .Deep);
+    }
+
+    fn final(self: *@This()) u64 {
+        return self.hasher.final();
+    }
+};
+
+/// Feed one input through a single nextSlice and through a loop of
+/// nextSliceUntil requesting every boundary, and require the same
+/// handler actions and the same parser state at every stop.
+fn differential(input: []const u8) !void {
+    const S = Stream(DifferentialHandler);
+
+    var plain: S = .init(.{ .handler = .{} });
+    defer plain.deinit();
+    plain.nextSlice(input);
+
+    // `reference` is fed exactly the bytes `until` reports consumed,
+    // call by call, so it is the "second Stream fed those bytes".
+    var until: S = .init(.{ .handler = .{} });
+    defer until.deinit();
+    var reference: S = .init(.{ .handler = .{} });
+    defer reference.deinit();
+
+    var stops: usize = 0;
+    var rem = input;
+    while (rem.len > 0) {
+        var set = all_set;
+        if (until.ground()) set.remove(.ground);
+        const stop = until.nextSliceUntil(rem, set) orelse {
+            reference.nextSlice(rem);
+            rem = rem[rem.len..];
+            break;
+        };
+        stops += 1;
+        try testing.expect(stop.consumed > 0);
+        try testing.expect(stop.consumed <= rem.len);
+        reference.nextSlice(rem[0..stop.consumed]);
+        rem = rem[stop.consumed..];
+
+        try testing.expectEqual(reference.parser.state, until.parser.state);
+        try testing.expectEqual(reference.utf8decoder.state, until.utf8decoder.state);
+        if (stop.reached.contains(.ground)) try testing.expect(until.ground());
+        if (stop.reached.contains(.apc_start)) {
+            try testing.expectEqual(Parser.State.sos_pm_apc_string, until.parser.state);
+            try testing.expect(stop.start != null);
+        }
+        if (stop.reached.contains(.apc_end)) {
+            try testing.expect(until.parser.state != .sos_pm_apc_string);
+            try testing.expect(stop.end != null);
+        }
+    }
+
+    try testing.expectEqual(plain.parser.state, until.parser.state);
+    try testing.expectEqual(plain.utf8decoder.state, until.utf8decoder.state);
+    try testing.expectEqual(plain.handler.actions, until.handler.actions);
+    try testing.expectEqual(plain.handler.final(), until.handler.final());
+    try testing.expectEqual(plain.handler.final(), reference.handler.final());
+}
+
+test "stream: nextSliceUntil differential on generated streams" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rand = prng.random();
+
+    // Pieces a generated stream is made of. Weighted toward APC and
+    // the bytes that end one, with enough text to cross the 4096-byte
+    // decode chunk.
+    const Piece = enum { text, utf8, csi, osc, apc_esc, apc_c1, apc_cut, raw, big_text, big_apc };
+    const terminators = [_][]const u8{ "\x1b\\", "\x9c", "\x18", "\x1a", "\x9f", "\x90", "\x9b", "\x85", "\x1b[m", "\x1b_" };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    for (0..64) |_| {
+        buf.clearRetainingCapacity();
+        const pieces = rand.intRangeAtMost(usize, 1, 48);
+        for (0..pieces) |_| {
+            switch (rand.enumValue(Piece)) {
+                .text => for (0..rand.intRangeAtMost(usize, 1, 64)) |_| {
+                    try buf.append(alloc, rand.intRangeAtMost(u8, 0x20, 0x7E));
+                },
+                .utf8 => for (0..rand.intRangeAtMost(usize, 1, 32)) |_| {
+                    var cp_buf: [4]u8 = undefined;
+                    const cp: u21 = rand.intRangeAtMost(u21, 0x80, 0x10FFFF);
+                    const n = std.unicode.utf8Encode(cp, &cp_buf) catch continue;
+                    try buf.appendSlice(alloc, cp_buf[0..n]);
+                },
+                .csi => {
+                    var seq: [32]u8 = undefined;
+                    try buf.appendSlice(alloc, try std.fmt.bufPrint(&seq, "\x1b[{d};{d}{c}", .{
+                        rand.intRangeAtMost(u8, 0, 99),
+                        rand.intRangeAtMost(u8, 0, 99),
+                        "mHJKABCDhlr"[rand.uintLessThan(usize, 11)],
+                    }));
+                },
+                .osc => {
+                    var seq: [32]u8 = undefined;
+                    try buf.appendSlice(alloc, try std.fmt.bufPrint(&seq, "\x1b]{d};title{d}{s}", .{
+                        rand.intRangeAtMost(u8, 0, 9),
+                        rand.int(u16),
+                        if (rand.boolean()) "\x07" else "\x1b\\",
+                    }));
+                },
+                .apc_esc, .apc_c1, .apc_cut => |kind| {
+                    try buf.appendSlice(alloc, if (kind == .apc_c1) "\x9f" else "\x1b_");
+                    try buf.appendSlice(alloc, "Gf=100,a=T;");
+                    for (0..rand.intRangeAtMost(usize, 0, 200)) |_| {
+                        try buf.append(alloc, rand.intRangeAtMost(u8, 0x20, 0x7E));
+                    }
+                    try buf.appendSlice(alloc, terminators[rand.uintLessThan(usize, terminators.len)]);
+                },
+                .raw => for (0..rand.intRangeAtMost(usize, 1, 16)) |_| {
+                    try buf.append(alloc, rand.int(u8));
+                },
+                .big_text => for (0..rand.intRangeAtMost(usize, 4000, 9000)) |_| {
+                    try buf.append(alloc, rand.intRangeAtMost(u8, 0x20, 0x7E));
+                },
+                .big_apc => {
+                    try buf.appendSlice(alloc, "\x1b_Gf=100,a=T;");
+                    for (0..rand.intRangeAtMost(usize, 4000, 9000)) |_| {
+                        try buf.append(alloc, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[rand.uintLessThan(usize, 64)]);
+                    }
+                    try buf.appendSlice(alloc, "\x1b\\");
+                },
+            }
+        }
+        try differential(buf.items);
+    }
+}
+
+/// Sees every parser action before the stream handles it and notes the
+/// one input shape the stream logs at error level (CSI t with no
+/// parameters), which the test runner would count as a failure.
+const LogErrProbe = struct {
+    csi_t_no_params: bool = false,
+
+    pub fn deinit(_: *@This()) void {}
+
+    pub fn vtRaw(self: *@This(), action: Parser.Action) !bool {
+        switch (action) {
+            .csi_dispatch => |dispatch| if (dispatch.final == 't' and
+                dispatch.intermediates.len == 0 and
+                dispatch.params.len == 0)
+            {
+                self.csi_t_no_params = true;
+            },
+            else => {},
+        }
+        return true;
+    }
+
+    pub fn vt(_: *@This(), comptime _: Action.Tag, _: anytype) void {}
+};
+
+test "stream: nextSliceUntil differential on the fuzz corpus" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // The corpus lives in the repo; tests run from the build root.
+    const path = "test/fuzz-libghostty/corpus/stream-cmin";
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var files: usize = 0;
+    var skipped: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const data = try dir.readFileAlloc(io, entry.name, alloc, .limited(4 << 20));
+        defer alloc.free(data);
+
+        var probe: Stream(LogErrProbe) = .init(.{ .handler = .{} });
+        defer probe.deinit();
+        probe.nextSlice(data);
+        if (probe.handler.csi_t_no_params) {
+            skipped += 1;
+            continue;
+        }
+
+        try differential(data);
+        files += 1;
+    }
+    try testing.expect(files > 1000);
+    try testing.expect(skipped < files / 10);
 }
 
 test "stream: continuation lifecycle" {

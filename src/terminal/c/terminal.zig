@@ -1079,8 +1079,8 @@ pub fn vt_write_until_ground(
     else
         return .invalid_value;
 
-    if (wrapper.stream.nextSliceUntilGround(input)) |consumed| {
-        out_consumed.* = consumed;
+    if (wrapper.stream.nextSliceUntil(input, .initOne(.ground))) |stop| {
+        out_consumed.* = stop.consumed;
         return .success;
     }
 

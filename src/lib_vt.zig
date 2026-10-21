@@ -97,6 +97,7 @@ pub const Terminal = terminal.Terminal;
 pub const TerminalStream = terminal.TerminalStream;
 pub const Stream = terminal.Stream;
 pub const StreamAction = terminal.StreamAction;
+pub const StreamBoundary = terminal.StreamBoundary;
 pub const SemanticPrompt = terminal.SemanticPrompt;
 pub const UnknownSequence = terminal.UnknownSequence;
 
