@@ -2361,7 +2361,7 @@ const Kitty = struct {
         // the pin's row is -reach or more. Walk up a page at a time, and
         // stop once a page's last row is too far up. `bottom` is the
         // last row of the page being checked.
-        const reach: isize = @as(isize, rows) - 1 + @max(0, vertical_offset);
+        const reach: isize = @as(isize, @intCast(rows)) - 1 + @max(0, vertical_offset);
         const first = chunks[0];
         var bottom: isize = first.index - @as(isize, first.start) - 1;
         var node = first.node.prev;
