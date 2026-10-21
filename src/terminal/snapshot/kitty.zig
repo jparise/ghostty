@@ -18,6 +18,42 @@
 //! terminal without images encodes exactly as it did before these records
 //! existed.
 //!
+//! ## Restoring a Terminal with Images
+//!
+//! Nothing changes for a caller that uses `snapshot.decode`: the restored
+//! terminal has its images, pixels and placements, ready to draw.
+//!
+//! With `snapshot.Decoder`, the terminal handed back at READY already has
+//! every image and placement, but the pixels have not arrived yet. Each
+//! image is "pending": it has an ID, a size and places on screen, so the
+//! layout is complete, but there is nothing to draw for it. The pixels
+//! arrive through `next`, one image or frame per call, mixed in with the
+//! history pages. A renderer that checks `Image.renderData` draws an image
+//! as soon as its pixels are in, without any other coordination:
+//!
+//! ```zig
+//! var decoded = try decoder.ready(alloc, io, options);
+//! defer decoded.deinit(alloc);
+//! var terminal = decoded.toOwned();
+//! defer terminal.deinit(alloc);
+//!
+//! // Pending images take part in layout, just not in drawing.
+//! const storage = &terminal.screens.active.kitty_images;
+//! const image = storage.imageById(1).?;
+//! image.renderData().isPending(); // true: nothing to draw yet
+//!
+//! // Each call restores one history page or one image's pixels.
+//! while (try decoder.next(alloc, &terminal)) |progress| switch (progress) {
+//!     .image => |p| if (p.image_id == 1) {
+//!         image.renderData().isPending(); // false: draw it
+//!     },
+//!     .page => {},
+//! };
+//! ```
+//!
+//! `Decoded.kitty` reports how many images were restored and how many
+//! bytes of pixels are still to come, which is enough for a progress bar.
+//!
 //! ## Where the Records Go
 //!
 //! ```text
@@ -87,19 +123,29 @@
 //! pixels right after the history page that first shows it, for example, so
 //! that large images deep in scrollback don't hold up recent history.
 //!
-//! This encoder writes all payloads right after READY, one screen at a
-//! time, so that what is on screen fills in first: images placed in the
-//! viewport, then the other images oldest first, then animation frames in
-//! the same order.
+//! This encoder writes payloads where the reader needs them soonest:
+//!
+//! 1. Right after READY, the images placed in the viewport of the screen
+//!    that is shown, so what is on screen can be drawn first. For each
+//!    image, the frame it shows comes before its other frames.
+//! 2. Right after each history page's KITTY_IMAGE_PAGE_PLACEMENTS, the
+//!    images first placed on that page, so an image in scrollback arrives
+//!    with the text around it, and a large one deep in scrollback doesn't
+//!    hold up the recent history before it.
+//! 3. After all history, everything else: images in the viewport of a
+//!    screen that is not shown, then images that are not placed where the
+//!    reader can see them. Nothing waits on these.
 //!
 //! Live input may delete an image before its payload arrives, or send a
 //! new image with the same ID. The payload is then dropped rather than
 //! attached to whatever image now has that ID.
 //!
-//! Payloads are compressed with zlib. Every terminal that supports Kitty
-//! graphics can already inflate zlib, because the protocol lets clients
-//! send compressed images (`o=z`), so a snapshot reader needs no extra
-//! decoder for them.
+//! Payloads carry the pixels as they are, with no compression of their
+//! own. A snapshot is normally compressed on its way to the reader, and on
+//! real images that compressor does at least as well on raw pixels as it
+//! would on pixels that were compressed first. Compressing them here would
+//! only add encoder time, and everything after the pixels would wait for
+//! it.
 //!
 //! The in-progress load is the one place where image data comes before
 //! READY. It carries every byte received so far, because the next chunk
@@ -298,23 +344,17 @@
 //!   6 +------------------------------------+
 //!     | Frame number (u32)                 |
 //!  10 +------------------------------------+
-//!     | Decoded byte length (u64)          |
+//!     | Byte length (u64)                  |
 //!  18 +------------------------------------+
-//!     | Compression (u8)                   |
-//!  19 +------------------------------------+
-//!     | Bytes                              |
+//!     | Pixels                             |
 //! end +------------------------------------+
 //! ```
 //!
 //! Frames are numbered as the Kitty graphics protocol numbers them. Frame 1
-//! is the image itself, so its decoded length is the image's decoded
-//! length. Frames 2 and up are animation frames, whose decoded length is
-//! width * height * 4.
-//!
-//! Compression is 0 for none, where the bytes are the pixels themselves, or
-//! 1 for zlib, where the bytes are a zlib stream that inflates to exactly
-//! the decoded length. Decoders must accept both. This encoder uses zlib
-//! unless it would not make the payload smaller.
+//! is the image itself, so its byte length is the image's decoded length.
+//! Frames 2 and up are animation frames, whose byte length is
+//! width * height * 4. The pixels are exactly that many bytes, and the
+//! record ends with them.
 //!
 //! ### KITTY_IMAGE_PAGE_PLACEMENTS
 //!
@@ -332,8 +372,6 @@ const std = @import("std");
 const build_options = @import("terminal_options");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const flate = std.compress.flate;
-const wuffs = @import("wuffs");
 const io = @import("io.zig");
 const record = @import("record.zig");
 const terminal_kitty = @import("../kitty.zig");
@@ -353,10 +391,6 @@ const PlacementId = ImageStorage.PlacementId;
 const Node = TerminalPageList.List.Node;
 
 const log = std.log.scoped(.snapshot_kitty);
-
-/// Whether the encoder compresses pixel payloads. Tests turn this off to
-/// produce uncompressed payloads, which every decoder must also accept.
-var compress_payloads: bool = true;
 
 /// Errors possible while encoding Kitty graphics records.
 pub const EncodeError = Allocator.Error || record.Writer.FinishError;
@@ -476,7 +510,7 @@ fn keyLessThan(lhs: PlacementKey, rhs: PlacementKey) bool {
     return lhs.placement_id.id < rhs.placement_id.id;
 }
 
-/// One KITTY_IMAGE_PAYLOAD record to encode.
+/// One KITTY_IMAGE_PAYLOAD record to encode, and when to write it.
 const PlannedPayload = struct {
     image: *const Image,
 
@@ -484,12 +518,60 @@ const PlannedPayload = struct {
     /// the image itself and 2 and up are its animation frames.
     frame: u32,
 
+    /// Which part of the snapshot the payload is written in.
+    stage: Stage,
+
+    /// For `.history`, the page the image is first placed on and that
+    /// page's ordinal. The payload is written right after that page. Zero
+    /// and null otherwise.
+    node: ?*const Node,
+    ordinal: u32,
+
+    /// True for the frame the image shows right now, which is the only
+    /// one a renderer needs to draw it. See `Image.renderData`.
+    displayed: bool,
+
+    /// The image's position in `ScreenPlan.images`, oldest first.
+    image_index: u32,
+
+    const Stage = enum(u2) {
+        /// The image is placed in the viewport. Written right after READY,
+        /// so what is on screen fills in first.
+        viewport,
+
+        /// The image is placed on a history page. Written right after that
+        /// page's KITTY_IMAGE_PAGE_PLACEMENTS, so images in scrollback
+        /// arrive with the text around them and don't hold up the history
+        /// pages before them.
+        history,
+
+        /// Everything else: images that are not placed, placed outside the
+        /// viewport on an active page, or on a screen that is not shown.
+        /// Written after all history, where nothing waits on them.
+        remaining,
+    };
+
     /// The pixels to encode.
     fn bytes(self: PlannedPayload) []const u8 {
         return switch (self.frame) {
             1 => self.image.data.bytes().?,
             else => self.image.animation.?.frames.items[self.frame - 2].data,
         };
+    }
+
+    /// The order payloads are written in: by stage, then newest history
+    /// page first, then the displayed frame of every image before the other
+    /// frames, then oldest image first, then by frame.
+    fn lessThan(_: void, lhs: PlannedPayload, rhs: PlannedPayload) bool {
+        if (lhs.stage != rhs.stage) {
+            return @backingInt(lhs.stage) < @backingInt(rhs.stage);
+        }
+        if (lhs.ordinal != rhs.ordinal) return lhs.ordinal > rhs.ordinal;
+        if (lhs.displayed != rhs.displayed) return lhs.displayed;
+        if (lhs.image_index != rhs.image_index) {
+            return lhs.image_index < rhs.image_index;
+        }
+        return lhs.frame < rhs.frame;
     }
 };
 
@@ -503,13 +585,14 @@ pub const Plan = if (build_options.kitty_graphics) ScreenPlan else void;
 /// Encoding a screen's Kitty graphics takes more than one pass over its
 /// storage. Images must be written oldest first, and placements must be
 /// sorted so parents come before children and split by the page they are
-/// pinned to. Pixel payloads are ordered so that images in the viewport
-/// come first. The plan does that work up front, and then writes each
-/// record where it belongs:
+/// pinned to. Pixel payloads are ordered so that what the reader can see
+/// arrives first (see `PlannedPayload.Stage`). The plan does that work up
+/// front, and then writes each record where it belongs:
 ///
 /// - `encodeStorage` right after the screen's SCREEN records.
-/// - `encodePayloads` after READY.
+/// - `encodeViewportPayloads` after READY.
 /// - `encodePagePlacements` right after each history page.
+/// - `encodeRemainingPayloads` after all history.
 ///
 /// `init` returns null when the screen has no images and no in-progress
 /// load. The snapshot then has no Kitty graphics records for that screen at
@@ -521,9 +604,11 @@ pub const Plan = if (build_options.kitty_graphics) ScreenPlan else void;
 /// defer plan.deinit();
 /// try plan.encodeStorage(&stream);
 /// // ... after READY ...
-/// try plan.encodePayloads(&stream);
+/// try plan.encodeViewportPayloads(&stream);
 /// // ... later, while encoding HISTORY ...
 /// try plan.encodePagePlacements(history_page, &stream);
+/// // ... after all history ...
+/// try plan.encodeRemainingPayloads(&stream);
 /// ```
 pub const ScreenPlan = struct {
     alloc: Allocator,
@@ -550,8 +635,17 @@ pub const ScreenPlan = struct {
     /// page list. Pages before it are history. See `RootPin.ordinal`.
     first_resident: u32,
 
-    /// KITTY_IMAGE_PAYLOAD records, in the order they are written.
+    /// KITTY_IMAGE_PAYLOAD records in the order they are written: the
+    /// viewport stage, then the history stage grouped by page newest
+    /// first, then the rest. See `PlannedPayload`.
     payloads: []PlannedPayload,
+
+    /// Where the history stage starts and ends in `payloads`.
+    history_payloads: struct { start: usize, end: usize },
+
+    /// The next history-stage payload that `encodePagePlacements` has not
+    /// written yet.
+    payload_next: usize,
 
     /// Plan the Kitty graphics records for `screen`, which the snapshot
     /// names `key`. Returns null if there is nothing to encode. The plan
@@ -633,8 +727,15 @@ pub const ScreenPlan = struct {
             screen,
             images,
             resident.items,
+            history.items,
         );
         errdefer alloc.free(payloads);
+        const history_start = for (payloads, 0..) |payload, i| {
+            if (payload.stage != .viewport) break i;
+        } else payloads.len;
+        const history_end = for (payloads[history_start..], history_start..) |payload, i| {
+            if (payload.stage != .history) break i;
+        } else payloads.len;
 
         const resident_slice = try resident.toOwnedSlice(alloc);
         errdefer alloc.free(resident_slice);
@@ -650,6 +751,8 @@ pub const ScreenPlan = struct {
             .history_next = 0,
             .first_resident = first_resident,
             .payloads = payloads,
+            .history_payloads = .{ .start = history_start, .end = history_end },
+            .payload_next = history_start,
         };
     }
 
@@ -762,83 +865,133 @@ pub const ScreenPlan = struct {
         try destination.finish();
     }
 
-    /// Plan a payload for every image and frame whose pixels are present.
-    /// Images placed in the viewport come first, then the rest oldest
-    /// first. Animation frames follow, in the same image order.
+    /// Plan a payload for every image and frame whose pixels are present,
+    /// sorted into the order they are written. See `PlannedPayload`.
     fn planPayloads(
         alloc: Allocator,
         screen: *const TerminalScreen,
         images: []const *const Image,
         resident: []const PlannedPlacement,
+        history: []const PlannedPlacement,
     ) Allocator.Error![]PlannedPayload {
-        var visible: std.AutoHashMapUnmanaged(u32, void) = .empty;
-        defer visible.deinit(alloc);
-        for (resident) |planned| {
-            const root = planned.root orelse {
+        // Where each placed image goes: in the viewport, or on the newest
+        // history page it is placed on.
+        const Where = struct { stage: PlannedPayload.Stage, node: ?*const Node, ordinal: u32 };
+        var placed: std.AutoHashMapUnmanaged(u32, Where) = .empty;
+        defer placed.deinit(alloc);
+
+        // The viewport may be scrolled into history, so every placement is
+        // checked against it. An image placed more than once takes the
+        // earliest stage of any of its placements, and among history
+        // placements the newest page, which comes first.
+        const Group = struct { items: []const PlannedPlacement, stage: PlannedPayload.Stage };
+        for ([_]Group{
+            .{ .items = resident, .stage = .remaining },
+            .{ .items = history, .stage = .history },
+        }) |group| for (group.items) |planned| {
+            const candidate: Where = candidate: {
                 // A virtual placement is drawn wherever its placeholder
                 // characters are, which is usually on screen.
-                try visible.put(alloc, planned.key.image_id, {});
-                continue;
+                const root = planned.root orelse break :candidate .{
+                    .stage = .viewport,
+                    .node = null,
+                    .ordinal = 0,
+                };
+                const pin: TerminalPageList.Pin = .{
+                    .node = root.node,
+                    .y = root.y,
+                    .x = root.x,
+                };
+                if (screen.pages.pointFromPin(.viewport, pin) != null) {
+                    break :candidate .{ .stage = .viewport, .node = null, .ordinal = 0 };
+                }
+                break :candidate switch (group.stage) {
+                    .history => .{
+                        .stage = .history,
+                        .node = root.node,
+                        .ordinal = root.ordinal,
+                    },
+                    else => .{ .stage = .remaining, .node = null, .ordinal = 0 },
+                };
             };
-            const pin: TerminalPageList.Pin = .{
-                .node = root.node,
-                .y = root.y,
-                .x = root.x,
-            };
-            if (screen.pages.pointFromPin(.viewport, pin) != null) {
-                try visible.put(alloc, planned.key.image_id, {});
+            const gop = try placed.getOrPut(alloc, planned.key.image_id);
+            if (!gop.found_existing or
+                @backingInt(candidate.stage) < @backingInt(gop.value_ptr.stage))
+            {
+                gop.value_ptr.* = candidate;
             }
-        }
+        };
 
         var result: std.ArrayList(PlannedPayload) = .empty;
         errdefer result.deinit(alloc);
-        for ([_]bool{ true, false }) |want_visible| {
-            for (images) |img| {
-                if (visible.contains(img.id) != want_visible) continue;
-                if (img.data.isPending()) continue;
-                try result.append(alloc, .{ .image = img, .frame = 1 });
+        for (images, 0..) |img, index| {
+            const where: Where = placed.get(img.id) orelse
+                .{ .stage = .remaining, .node = null, .ordinal = 0 };
+
+            // The displayed frame is the current animation frame, or the
+            // image itself.
+            const displayed: u32 = if (img.animation) |anim|
+                anim.current_index + 1
+            else
+                1;
+
+            const frame_count: u32 = if (img.animation) |anim|
+                @intCast(anim.frames.items.len + 1)
+            else
+                1;
+            for (1..frame_count + 1) |number| {
+                const frame: u32 = @intCast(number);
+                const present = switch (frame) {
+                    1 => !img.data.isPending(),
+                    else => !img.animation.?.frames.items[frame - 2].isPending(),
+                };
+                if (!present) continue;
+                try result.append(alloc, .{
+                    .image = img,
+                    .frame = frame,
+                    .stage = where.stage,
+                    .node = where.node,
+                    .ordinal = where.ordinal,
+                    .displayed = frame == displayed,
+                    .image_index = @intCast(index),
+                });
             }
         }
-        for ([_]bool{ true, false }) |want_visible| {
-            for (images) |img| {
-                if (visible.contains(img.id) != want_visible) continue;
-                const anim = img.animation orelse continue;
-                for (anim.frames.items, 2..) |frame, number| {
-                    if (frame.isPending()) continue;
-                    try result.append(alloc, .{
-                        .image = img,
-                        .frame = @intCast(number),
-                    });
-                }
-            }
-        }
+        std.sort.pdq(PlannedPayload, result.items, {}, PlannedPayload.lessThan);
         return result.toOwnedSlice(alloc);
     }
 
-    /// Encode a KITTY_IMAGE_PAYLOAD record for each image and frame with
-    /// pixels, or nothing when there are none. Call this after READY.
-    pub fn encodePayloads(
+    /// Encode a KITTY_IMAGE_PAYLOAD record for each image placed in the
+    /// viewport, or nothing when there are none. Call this after READY.
+    /// For the screen that is shown, call it first thing after READY so the
+    /// reader can draw what is on screen as soon as possible.
+    pub fn encodeViewportPayloads(
         self: *const ScreenPlan,
         destination: *record.Writer,
     ) EncodeError!void {
-        if (self.payloads.len == 0) return;
+        for (self.payloads[0..self.history_payloads.start]) |payload| {
+            try encodePayload(destination, self.key, payload);
+        }
+    }
 
-        // The compressor is too large for the stack, so allocate it once
-        // and reuse it for every payload of this screen.
-        var compressor: ?*Compressor = null;
-        defer if (compressor) |c| self.alloc.destroy(c);
-        if (compress_payloads) compressor = try self.alloc.create(Compressor);
-
-        for (self.payloads) |payload| try encodePayload(
-            destination,
-            compressor,
-            self.key,
-            payload,
-        );
+    /// Encode a KITTY_IMAGE_PAYLOAD record for each image and frame whose
+    /// pixels have not been written by `encodeViewportPayloads` or
+    /// `encodePagePlacements`. Call this after the screen's HISTORY, which
+    /// must have been encoded with this plan.
+    pub fn encodeRemainingPayloads(
+        self: *const ScreenPlan,
+        destination: *record.Writer,
+    ) EncodeError!void {
+        assert(self.payload_next == self.history_payloads.end);
+        for (self.payloads[self.history_payloads.end..]) |payload| {
+            try encodePayload(destination, self.key, payload);
+        }
     }
 
     /// Encode the KITTY_IMAGE_PAGE_PLACEMENTS record for one history page, if
-    /// any placement is pinned to it, and nothing otherwise. Call this right
+    /// any placement is pinned to it, and nothing otherwise. Then encode the
+    /// KITTY_IMAGE_PAYLOAD records of the images that are first placed on
+    /// this page, so they arrive with the text around them. Call this right
     /// after the page's PAGE record. Pages must be visited newest first, in
     /// the same order HISTORY encodes them.
     pub fn encodePagePlacements(
@@ -850,17 +1003,24 @@ pub const ScreenPlan = struct {
         var end = start;
         while (end < self.history.len and
             self.history[end].root.?.node == node) end += 1;
-        if (end == start) return;
-        self.history_next = end;
+        if (end > start) {
+            self.history_next = end;
 
-        const writer = destination.begin(.kitty_image_page_placements);
-        errdefer destination.cancel();
-        try encodeKey(writer, self.key);
-        try io.writeInt(writer, u32, @intCast(end - start));
-        for (self.history[start..end]) |planned| {
-            try encodePlacement(writer, planned, .page);
+            const writer = destination.begin(.kitty_image_page_placements);
+            errdefer destination.cancel();
+            try encodeKey(writer, self.key);
+            try io.writeInt(writer, u32, @intCast(end - start));
+            for (self.history[start..end]) |planned| {
+                try encodePlacement(writer, planned, .page);
+            }
+            try destination.finish();
         }
-        try destination.finish();
+
+        while (self.payload_next < self.history_payloads.end and
+            self.payloads[self.payload_next].node == node) : (self.payload_next += 1)
+        {
+            try encodePayload(destination, self.key, self.payloads[self.payload_next]);
+        }
     }
 };
 
@@ -1044,23 +1204,12 @@ fn decodeCompression(raw: u8) ?Compression {
     };
 }
 
-/// Deflate state for compressing payloads.
-const Compressor = struct {
-    window: [flate.max_window_len]u8,
-    state: flate.Compress,
-};
-
-/// The offset of the compression byte in a KITTY_IMAGE_PAYLOAD record.
-const payload_compression_offset = 18;
-
 /// The number of KITTY_IMAGE_PAYLOAD bytes before the pixel bytes.
-const payload_header_len = payload_compression_offset + 1;
+const payload_header_len = 18;
 
-/// Encode one KITTY_IMAGE_PAYLOAD record. With a compressor, the pixels are
-/// compressed, unless that would not make them smaller.
+/// Encode one KITTY_IMAGE_PAYLOAD record.
 fn encodePayload(
     destination: *record.Writer,
-    compressor: ?*Compressor,
     key: TerminalScreenKey,
     payload: PlannedPayload,
 ) EncodeError!void {
@@ -1071,34 +1220,7 @@ fn encodePayload(
     try io.writeInt(writer, u32, payload.image.id);
     try io.writeInt(writer, u32, payload.frame);
     try io.writeInt(writer, u64, bytes.len);
-    assert(writer.end == payload_compression_offset);
-
-    compressed: {
-        const c = compressor orelse break :compressed;
-        try writer.writeByte(encodeCompression(.zlib_deflate));
-
-        // The deflate encoder needs room for its output in the record's
-        // buffer.
-        try destination.scratch.ensureUnusedCapacity(64);
-        c.state = try flate.Compress.init(
-            writer,
-            &c.window,
-            .zlib,
-            .fastest,
-        );
-        try c.state.writer.writeAll(bytes);
-        try c.state.finish();
-
-        // Keep the compressed form only if it is actually smaller.
-        // Otherwise rewind to the compression byte and write the pixels
-        // as they are.
-        if (writer.end - payload_header_len < bytes.len) {
-            return destination.finish();
-        }
-        writer.end = payload_compression_offset;
-    }
-
-    try writer.writeByte(encodeCompression(.none));
+    assert(writer.end == payload_header_len);
     try writer.writeAll(bytes);
     try destination.finish();
 }
@@ -1723,8 +1845,7 @@ pub const Payload = struct {
 /// screen still has the image the snapshot restored, and the image or
 /// frame is still pending with the same length. Otherwise the record is
 /// read and checked but its pixels are dropped, and the result reports
-/// zero bytes. A compressed payload that does not inflate to exactly the
-/// declared length is dropped the same way.
+/// zero bytes.
 ///
 /// ```zig
 /// var targets: kitty.PayloadTargets = .init(.{});
@@ -1755,7 +1876,6 @@ pub fn decodePayload(
     const image_id = try io.readInt(reader, u32);
     const frame = try io.readInt(reader, u32);
     const decoded_len = try io.readInt(reader, u64);
-    const compression = decodeCompression(try reader.takeByte());
     const target = targets.get(key);
 
     var result: Payload = .{
@@ -1769,7 +1889,6 @@ pub fn decodePayload(
     // ticket to complete it with.
     const ticket: ?ImageStorage.PendingImage = ticket: {
         const t = target orelse break :ticket null;
-        if (compression == null) break :ticket null;
         const img = t.screen.kitty_images.images.getPtr(image_id) orelse
             break :ticket null;
         if (img.transmission > t.ready_generation) break :ticket null;
@@ -1796,26 +1915,12 @@ pub fn decodePayload(
         return result;
     };
 
-    const len: usize = @intCast(decoded_len);
-    const data: []u8 = switch (compression.?) {
-        .none => data: {
-            const data = try alloc.alloc(u8, len);
-            errdefer alloc.free(data);
-            try reader.readSliceAll(data);
-            break :data data;
-        },
-        .zlib_deflate => try inflate(
-            alloc,
-            reader,
-            record_header.payload_len - payload_header_len,
-            len,
-        ) orelse {
-            try record_reader.finish();
-            return result;
-        },
-    };
+    // The record must hold exactly the declared pixels: a short one fails
+    // the read, a long one fails `finish`.
+    const data = try alloc.alloc(u8, @intCast(decoded_len));
     var owned = true;
     defer if (owned) alloc.free(data);
+    try reader.readSliceAll(data);
     try record_reader.finish();
 
     const storage = &target.?.screen.kitty_images;
@@ -1828,34 +1933,6 @@ pub fn decodePayload(
         result.bytes = data.len;
     }
     return result;
-}
-
-/// Read `compressed_len` bytes of zlib stream from `reader` and inflate
-/// them. Returns the pixels, which the caller owns, or null when the stream
-/// is corrupt or does not inflate to exactly `len` bytes.
-///
-/// This uses the same zlib decoder as Kitty graphics transmissions with
-/// compression (`o=z`), so a build that can show Kitty images needs no
-/// other decoder for snapshots.
-fn inflate(
-    alloc: Allocator,
-    reader: *std.Io.Reader,
-    compressed_len: usize,
-    len: usize,
-) DecodeError!?[]u8 {
-    const compressed = try alloc.alloc(u8, compressed_len);
-    defer alloc.free(compressed);
-    try reader.readSliceAll(compressed);
-
-    const data = wuffs.zlib.decode(alloc, compressed, len, len) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.WuffsError, error.Overflow => return null,
-    };
-    if (data.len != len) {
-        alloc.free(data);
-        return null;
-    }
-    return data;
 }
 
 /// The history page a KITTY_IMAGE_PAGE_PLACEMENTS record restores placements
@@ -2374,26 +2451,6 @@ test "golden snapshot with an in-progress chunked load" {
     try testGolden(&t, "kitty-loading", &test_loading_fixture);
 }
 
-const test_incompressible_fixture = test_fixture.parse(@embedFile("testdata/kitty-incompressible-v1.hex"));
-
-test "golden snapshot with a payload deflate cannot shrink" {
-    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
-    var t = try testTerminal(4, 2);
-    defer t.deinit(testing.allocator);
-
-    var pixels: [64]u8 = undefined;
-    var prng: std.Random.DefaultPrng = .init(0x5eed);
-    prng.random().bytes(&pixels);
-    try testCommand(&t, "a=T,f=32,s=4,v=4,i=7,C=1,q=2", &pixels);
-    try testGolden(&t, "kitty-incompressible", &test_incompressible_fixture);
-
-    // The payload is stored uncompressed, right after its compression byte.
-    const fixture: []const u8 = &test_incompressible_fixture;
-    const index = std.mem.indexOf(u8, fixture, &pixels) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(u8, 0), fixture[index - 1]);
-}
-
 const test_alternate_fixture = test_fixture.parse(@embedFile("testdata/kitty-alternate-v1.hex"));
 
 test "golden snapshot with an image on the alternate screen" {
@@ -2514,7 +2571,6 @@ test "Kitty graphics records are skipped without Kitty graphics support" {
         &test_history_fixture,
         &test_animation_fixture,
         &test_loading_fixture,
-        &test_incompressible_fixture,
         &test_alternate_fixture,
     };
     for (fixtures) |fixture| {
@@ -2667,12 +2723,12 @@ test "incremental decode restores images at READY and payloads after" {
     try testing.expect(storage.animationTick(testing.io, 0) == null);
     try testing.expectEqual(2, storage.placements.count());
 
-    // Payloads arrive one per call: visible images first, oldest first,
-    // then animation frames.
+    // Payloads arrive one per call: the displayed frame of every visible
+    // image first, oldest image first, then the other animation frames.
     const expected = [_]struct { id: u32, frame: u32, bytes: usize }{
-        .{ .id = 5, .frame = 1, .bytes = 8 },
-        .{ .id = 9, .frame = 1, .bytes = 256 },
         .{ .id = 5, .frame = 2, .bytes = 8 },
+        .{ .id = 9, .frame = 1, .bytes = 256 },
+        .{ .id = 5, .frame = 1, .bytes = 8 },
         .{ .id = 5, .frame = 3, .bytes = 8 },
     };
     for (expected, 0..) |e, i| {
@@ -2782,6 +2838,77 @@ test "a dropped history page drops its placements" {
     }
 }
 
+test "an image placed only in history arrives with its page" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var t = try testHistoryTerminal();
+    defer t.deinit(testing.allocator);
+
+    // One image on the oldest history page, and one that is not placed.
+    try testCommand(&t, "a=t,f=32,s=1,v=1,i=4,q=2", &testPixels(4, .{ 9, 9, 9, 255 }));
+    try testCommand(&t, "a=t,f=32,s=1,v=1,i=5,q=2", &testPixels(4, .{ 7, 7, 7, 255 }));
+    const oldest = t.screens.active.pages.pages.first.?;
+    try testPlace(&t, oldest, 4, 1, 1, 1);
+    const encoded = try testEncode(&t);
+    defer testing.allocator.free(encoded);
+
+    // The placed image's pixels follow its page's placements, and the
+    // unplaced image's pixels come after all history.
+    const records = try testRecords(encoded);
+    defer testing.allocator.free(records);
+    var tags: std.ArrayList(record.Tag) = .empty;
+    defer tags.deinit(testing.allocator);
+    var after_ready = false;
+    for (records) |r| {
+        if (after_ready) try tags.append(testing.allocator, r.tag);
+        if (r.tag == .ready) after_ready = true;
+    }
+    try testing.expectEqualSlices(record.Tag, &.{
+        .history,
+        .page,
+        .page,
+        .kitty_image_page_placements,
+        .kitty_image_payload,
+        .kitty_image_payload,
+        .finish,
+    }, tags.items);
+
+    // The incremental decoder sees the same order, and the placement is
+    // there by the time its pixels arrive.
+    var source: std.Io.Reader = .fixed(encoded);
+    var decoder: snapshot.Decoder = .init(&source);
+    var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
+    defer decoded.deinit(testing.allocator);
+    const restored = &decoded.terminal.?;
+    const storage = &restored.screens.active.kitty_images;
+    try testing.expectEqual(0, storage.placements.count());
+    for (0..2) |_| _ = (try decoder.next(testing.allocator, restored)).?.page;
+    try testing.expectEqual(1, storage.placements.count());
+    try testing.expect(storage.imageById(4).?.data.isPending());
+    const first = (try decoder.next(testing.allocator, restored)).?.image;
+    try testing.expectEqual(4, first.image_id);
+    try testing.expectEqual(4, first.bytes);
+    const second = (try decoder.next(testing.allocator, restored)).?.image;
+    try testing.expectEqual(5, second.image_id);
+    try testing.expect(try decoder.next(testing.allocator, restored) == null);
+    try expectStorageEqual(&t, restored, .primary);
+}
+
+test "history placements restore onto compressed history pages" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var t = try testHistoryPlacedTerminal();
+    defer t.deinit(testing.allocator);
+    const encoded = try testEncode(&t);
+    defer testing.allocator.free(encoded);
+
+    var restored = try testDecode(encoded, .{
+        .max_continuation_bytes = 1024,
+        .compress_history = true,
+    });
+    defer restored.deinit(testing.allocator);
+    try expectStorageEqual(&t, &restored, .primary);
+    try testing.expectEqual(4, restored.screens.active.kitty_images.placements.count());
+}
+
 test "a restored in-progress load continues the chunked transmission" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
     var t = try testTerminal(4, 2);
@@ -2811,34 +2938,7 @@ test "a restored in-progress load continues the chunked transmission" {
     try expectStorageEqual(&t, &restored, .primary);
 }
 
-test "uncompressed and compressed payloads decode alike" {
-    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
-    var t = try testPlacedTerminal();
-    defer t.deinit(testing.allocator);
-
-    // Encode the same terminal with and without compression.
-    compress_payloads = false;
-    const uncompressed = testEncode(&t);
-    compress_payloads = true;
-    const plain = try uncompressed;
-    defer testing.allocator.free(plain);
-    const compressed = try testEncode(&t);
-    defer testing.allocator.free(compressed);
-    try testing.expect(plain.len > compressed.len);
-
-    for ([_][]const u8{ plain, compressed }) |bytes| {
-        var restored = try testDecode(bytes, test_decode_options);
-        defer restored.deinit(testing.allocator);
-        try expectStorageEqual(&t, &restored, .primary);
-
-        // Either way, the restored terminal encodes like any other.
-        const reencoded = try testEncode(&restored);
-        defer testing.allocator.free(reencoded);
-        try testing.expectEqualSlices(u8, compressed, reencoded);
-    }
-}
-
-test "a corrupt compressed payload is dropped" {
+test "a payload with fewer pixels than it declares fails" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
     const records = try testRecords(&test_placed_fixture);
     defer testing.allocator.free(records);
@@ -2846,20 +2946,23 @@ test "a corrupt compressed payload is dropped" {
         if (r.tag == .kitty_image_payload) break r;
     } else unreachable;
 
-    // Corrupt the zlib stream and fix up the record's CRC, so the record
-    // is valid but the stream inside it is not.
-    const corrupted = try testing.allocator.dupe(u8, &test_placed_fixture);
-    defer testing.allocator.free(corrupted);
-    const body = corrupted[payload.start + record.Header.len .. payload.end];
-    body[payload_header_len + 2] ^= 0xff;
-    var checksum: record.Checksum = .init(.kitty_image_payload, @intCast(body.len));
-    try checksum.writer().writeAll(body);
-    std.mem.writeInt(u32, corrupted[payload.start + 6 ..][0..4], checksum.final(), .little);
+    // Drop the last pixel byte and fix up the record's length and CRC, so
+    // the record is well formed but shorter than its declared pixels.
+    var short: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer short.deinit();
+    try short.writer.writeAll(test_placed_fixture[0..payload.start]);
+    const body = test_placed_fixture[payload.start + record.Header.len .. payload.end - 1];
+    try record.testWriteRaw(
+        &short.writer,
+        @backingInt(record.Tag.kitty_image_payload),
+        body,
+    );
+    try short.writer.writeAll(test_placed_fixture[payload.end..]);
 
-    var restored = try testDecode(corrupted, test_decode_options);
-    defer restored.deinit(testing.allocator);
-    const img = restored.screens.active.kitty_images.imageById(1).?;
-    try testing.expect(img.data.isPending());
+    try testing.expectError(
+        error.EndOfStream,
+        testDecode(short.written(), test_decode_options),
+    );
 }
 
 test "completing a placeholder image's payload updates the render state" {

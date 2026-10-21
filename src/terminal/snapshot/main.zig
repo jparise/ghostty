@@ -71,8 +71,10 @@
 //! ```
 //!
 //! The optional Kitty graphics records carry each screen's images, pixels
-//! and placements. They are only written for screens that have images. See
-//! `kitty.zig`.
+//! and placements. They are only written for screens that have images.
+//! The pixels of the images on screen come right after READY, the pixels
+//! of images in scrollback come right after their history page, and the
+//! rest come after all history. See `kitty.zig`.
 //!
 //! A decoder skips any record whose tag it does not know, wherever it
 //! appears, after checking its length and CRC32C. This lets newer encoders
@@ -152,8 +154,8 @@
 //!
 //! `snapshot.Decoder` decodes the same stream incrementally so the terminal
 //! becomes usable at READY, before history has arrived. Each `next` call
-//! applies one history page to the by-then live terminal and returning null
-//! validates FINISH:
+//! applies one history page, or the pixels of one image, to the by-then
+//! live terminal. A null result means FINISH was validated:
 //!
 //! ```zig
 //! var decoder: snapshot.Decoder = .init(&reader);

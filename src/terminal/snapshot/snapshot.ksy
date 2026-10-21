@@ -1436,8 +1436,8 @@ types:
     doc: |
       The pixels of one image or animation frame. Frames are numbered as
       the Kitty graphics protocol numbers them: frame 1 is the image itself
-      and frames 2 and up are its animation frames. Compressed data is a
-      zlib stream that inflates to exactly decoded_length bytes.
+      and frames 2 and up are its animation frames. The record holds
+      exactly len_data bytes of pixels.
     seq:
       - id: key
         type: u2
@@ -1450,13 +1450,10 @@ types:
         type: u4
         valid:
           min: 1
-      - id: decoded_length
+      - id: len_data
         type: u8
-      - id: compression
-        type: u1
-        enum: kitty_compression
       - id: data
-        size-eos: true
+        size: len_data
 
   kitty_image_page_placements_payload:
     doc: Placements pinned to the preceding history PAGE, parents first.

@@ -98,23 +98,23 @@ ee ee 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000037a
 # offset 0x000004af: ready record, payload 0 bytes
 05 00 00 00 00 00 e4 20 ef 0a # 0x000004af
 
-# offset 0x000004b9: kitty_image_payload record, payload 27 bytes
-09 00 1b 00 00 00 ac c4 73 9f 00 00 05 00 00 00 # 0x000004b9
-01 00 00 00 08 00 00 00 00 00 00 00 00 ff 00 00 # 0x000004c9
-ff ff 00 00 ff # 0x000004d9
+# offset 0x000004b9: kitty_image_payload record, payload 26 bytes
+09 00 1a 00 00 00 ef 34 d2 d9 00 00 05 00 00 00 # 0x000004b9
+02 00 00 00 08 00 00 00 00 00 00 00 00 ff 00 ff # 0x000004c9
+00 ff 00 ff # 0x000004d9
 
-# offset 0x000004de: kitty_image_payload record, payload 27 bytes
-09 00 1b 00 00 00 9b 8c 6f 53 00 00 05 00 00 00 # 0x000004de
-02 00 00 00 08 00 00 00 00 00 00 00 00 00 ff 00 # 0x000004ee
-ff 00 ff 00 ff # 0x000004fe
+# offset 0x000004dd: kitty_image_payload record, payload 26 bytes
+09 00 1a 00 00 00 28 e2 14 5b 00 00 05 00 00 00 # 0x000004dd
+01 00 00 00 08 00 00 00 00 00 00 00 ff 00 00 ff # 0x000004ed
+ff 00 00 ff # 0x000004fd
 
-# offset 0x00000503: kitty_image_payload record, payload 27 bytes
-09 00 1b 00 00 00 fc 9a b7 ae 00 00 05 00 00 00 # 0x00000503
-03 00 00 00 08 00 00 00 00 00 00 00 00 00 00 ff # 0x00000513
-ff 00 00 00 00 # 0x00000523
+# offset 0x00000501: kitty_image_payload record, payload 26 bytes
+09 00 1a 00 00 00 d8 a8 43 1e 00 00 05 00 00 00 # 0x00000501
+03 00 00 00 08 00 00 00 00 00 00 00 00 00 ff ff # 0x00000511
+00 00 00 00 # 0x00000521
 
-# offset 0x00000528: history record, payload 6 bytes
-04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x00000528
+# offset 0x00000525: history record, payload 6 bytes
+04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x00000525
 
-# offset 0x00000538: finish record, payload 0 bytes
-06 00 00 00 00 00 3e eb 53 3e # 0x00000538
+# offset 0x00000535: finish record, payload 0 bytes
+06 00 00 00 00 00 3e eb 53 3e # 0x00000535

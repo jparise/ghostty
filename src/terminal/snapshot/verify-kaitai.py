@@ -22,7 +22,7 @@ what portable Kaitai expressions cannot represent: every record's CRC32C,
 including records with unknown tags, the order, declared counts and screen
 keys of the known records, that Kitty graphics image lengths and pins are
 consistent with the pages and images they refer to, and that every pixel
-payload decodes to exactly the length its image or frame expects.
+payload holds exactly the pixels its image or frame expects.
 """
 
 from __future__ import annotations
@@ -35,7 +35,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -376,19 +375,14 @@ def validate_kitty_image_payload(
         if payload.frame - 2 >= len(frames):
             raise ValueError("payload for a missing animation frame")
         expected = frames[payload.frame - 2].data_length
-    if payload.decoded_length != expected:
-        raise ValueError("payload decoded_length mismatch")
-    data = payload.data
-    if payload.compression.name == "zlib":
-        data = zlib.decompress(data)
-    if len(data) != payload.decoded_length:
-        raise ValueError("payload does not decode to decoded_length")
+    if payload.len_data != expected:
+        raise ValueError("payload len_data mismatch")
 
 
 def validate_kitty(structure: Structure) -> None:
     """Validate the Kitty graphics records: screen keys, image and frame
     lengths, that every pin names a cell of its page, and that every pixel
-    payload belongs to an image and decodes to its expected length."""
+    payload belongs to an image and has its expected length."""
     images_by_key: dict[Any, dict[int, Any]] = {}
     for screen in structure.screens:
         key = screen.record.payload.header.key

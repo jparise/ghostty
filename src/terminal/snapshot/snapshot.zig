@@ -103,18 +103,32 @@ pub fn encode(
     // 5. Ready marker.
     try checkpoint.encode(.ready, &stream);
 
-    // 6. Each screen's Kitty graphics pixels. They come after READY so
-    // the decoder can show the terminal without waiting for them.
-    if (comptime build_options.kitty_graphics) {
-        for (std.enums.values(TerminalScreenKey)) |key| {
-            if (kitty_plans.getPtr(key).*) |*plan| {
-                try plan.encodePayloads(&stream);
+    // Kitty graphics pixels are written in the order the reader needs
+    // them, and the screen that is shown comes first in that order, so
+    // what the reader can see arrives before what it cannot.
+    const active_key = t.screens.active_key;
+    const other_keys: []const TerminalScreenKey = switch (active_key) {
+        inline else => |active| comptime other: {
+            var keys: []const TerminalScreenKey = &.{};
+            for (std.enums.values(TerminalScreenKey)) |key| {
+                if (key != active) keys = keys ++ .{key};
             }
+            break :other keys;
+        },
+    };
+
+    // 6. The pixels of the Kitty graphics images in the shown screen's
+    // viewport. They come after READY so the decoder can show the terminal
+    // without waiting for them, and before history so the reader can draw
+    // what is on screen as soon as possible.
+    if (comptime build_options.kitty_graphics) {
+        if (kitty_plans.getPtr(active_key).*) |*plan| {
+            try plan.encodeViewportPayloads(&stream);
         }
     }
 
     // 7. Each screen's history, with the Kitty graphics placements pinned
-    // to each page.
+    // to each page and the pixels of the images first placed there.
     for (std.enums.values(TerminalScreenKey)) |key| {
         const s = t.screens.get(key) orelse continue;
         const plan: ?*kitty.Plan = if (kitty_plans.getPtr(key).*) |*p| p else null;
@@ -126,7 +140,26 @@ pub fn encode(
         );
     }
 
-    // 8. Finish
+    // 8. The pixels nothing is waiting on: images in the viewport of a
+    // screen that is not shown, then every image that is not placed where
+    // the reader can see it.
+    if (comptime build_options.kitty_graphics) {
+        for (other_keys) |key| {
+            if (kitty_plans.getPtr(key).*) |*plan| {
+                try plan.encodeViewportPayloads(&stream);
+            }
+        }
+        if (kitty_plans.getPtr(active_key).*) |*plan| {
+            try plan.encodeRemainingPayloads(&stream);
+        }
+        for (other_keys) |key| {
+            if (kitty_plans.getPtr(key).*) |*plan| {
+                try plan.encodeRemainingPayloads(&stream);
+            }
+        }
+    }
+
+    // 9. Finish
     try checkpoint.encode(.finish, &stream);
 }
 
