@@ -50,6 +50,8 @@
 //! +----------------------------------------+
 //! | SCREEN * terminal.screen_count         |
 //! | PAGE * each screen.page_count          |
+//! | KITTY_IMAGE_STORAGE (optional, per     |
+//! |   screen)                              |
 //! +----------------------------------------+
 //! | CONTINUATION                           |
 //! +----------------------------------------+
@@ -57,10 +59,16 @@
 //! +----------------------------------------+
 //! | HISTORY * terminal.screen_count        |
 //! | PAGE * each history.page_count         |
+//! | KITTY_IMAGE_PAGE_PLACEMENTS (optional, |
+//! |   after a PAGE with placements on it)  |
 //! +----------------------------------------+
 //! | FINISH                                 |
 //! +----------------------------------------+
 //! ```
+//!
+//! The optional Kitty graphics records carry each screen's images and
+//! placements. They are only written for screens that have images. See
+//! `kitty.zig`.
 //!
 //! A decoder skips any record whose tag it does not know, wherever it
 //! appears, after checking its length and CRC32C. This lets newer encoders
@@ -183,6 +191,7 @@ pub const envelope = @import("envelope.zig");
 pub const grid = @import("grid.zig");
 pub const history = @import("history.zig");
 pub const hyperlink = @import("hyperlink.zig");
+pub const kitty = @import("kitty.zig");
 pub const page = @import("page.zig");
 pub const record = @import("record.zig");
 pub const screen = @import("screen.zig");

@@ -74,6 +74,7 @@
 //! themselves. Only the first header comes from the caller.
 
 const std = @import("std");
+const build_options = @import("terminal_options");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const test_fixture = @import("fixture.zig");
@@ -115,6 +116,14 @@ pub const Tag = enum(u16) {
     /// Canonical unfinished standard TerminalStream input.
     continuation = 7,
 
+    /// One screen's Kitty graphics images, placements and in-progress
+    /// load. Optional. See `kitty.zig`.
+    kitty_image_storage = 8,
+
+    /// The Kitty graphics placements pinned to the history PAGE right
+    /// before this record. Optional. See `kitty.zig`.
+    kitty_image_page_placements = 10,
+
     _,
 
     /// Returns true if this build decodes records with this tag, and false
@@ -137,6 +146,12 @@ pub const Tag = enum(u16) {
             .finish,
             .continuation,
             => true,
+
+            // A build without Kitty graphics skips these records and
+            // restores the terminal without its images.
+            .kitty_image_storage,
+            .kitty_image_page_placements,
+            => build_options.kitty_graphics,
 
             _ => false,
         };

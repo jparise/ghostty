@@ -19,8 +19,9 @@ The generated Python parser exists only in a temporary directory. This keeps
 snapshot.ksy as the source of truth and ensures this check cannot accidentally
 pass against stale generated code. After structural parsing, the script checks
 what portable Kaitai expressions cannot represent: every record's CRC32C,
-including records with unknown tags, and the order, declared counts and screen
-keys of the known records.
+including records with unknown tags, the order, declared counts and screen
+keys of the known records, and that Kitty graphics image lengths and pins
+are consistent with the pages and images they refer to.
 """
 
 from __future__ import annotations
@@ -195,15 +196,31 @@ TAG_HISTORY = 4
 TAG_READY = 5
 TAG_FINISH = 6
 TAG_CONTINUATION = 7
-KNOWN_TAGS = set(range(TAG_TERMINAL, TAG_CONTINUATION + 1))
+TAG_KITTY_IMAGE_STORAGE = 8
+TAG_KITTY_IMAGE_PAGE_PLACEMENTS = 10
+KNOWN_TAGS = {
+    *range(TAG_TERMINAL, TAG_CONTINUATION + 1),
+    TAG_KITTY_IMAGE_STORAGE,
+    TAG_KITTY_IMAGE_PAGE_PLACEMENTS,
+}
+KITTY_BPP = {"rgb": 3, "rgba": 4, "gray_alpha": 2, "gray": 1}
 
 
 @dataclass
 class Sequence:
-    """A SCREEN or HISTORY record and its PAGE records."""
+    """A SCREEN or HISTORY record, its PAGE records, and the optional Kitty
+    graphics records that belong to it."""
 
     record: Any
     pages: list[Any]
+
+    # SCREEN only: the KITTY_IMAGE_STORAGE record right after the pages, or
+    # None.
+    kitty_image_storage: Any | None
+
+    # HISTORY only: the KITTY_IMAGE_PAGE_PLACEMENTS record after each page, or
+    # None for a page without one.
+    page_placements: list[Any | None]
 
 
 @dataclass
@@ -247,12 +264,30 @@ class KnownRecords:
         self.index += 1
         return record
 
+    def take_optional(self, tag: int) -> Any | None:
+        """Consume the next known record if it has this tag."""
+        return self.take(tag) if self.peek() == tag else None
+
     def take_sequence(self, tag: int, page_count: Any) -> Sequence:
-        """Consume a SCREEN or HISTORY record and the PAGE records it
-        declares. page_count reads the declared count from that record."""
+        """Consume a SCREEN or HISTORY record, the PAGE records it declares,
+        and the optional Kitty graphics records that follow them. page_count
+        reads the declared count from the first record."""
         record = self.take(tag)
-        pages = [self.take(TAG_PAGE) for _ in range(page_count(record))]
-        return Sequence(record, pages)
+        pages: list[Any] = []
+        page_placements: list[Any | None] = []
+        for _ in range(page_count(record)):
+            pages.append(self.take(TAG_PAGE))
+            page_placements.append(
+                self.take_optional(TAG_KITTY_IMAGE_PAGE_PLACEMENTS)
+                if tag == TAG_HISTORY
+                else None
+            )
+        kitty_image_storage = (
+            self.take_optional(TAG_KITTY_IMAGE_STORAGE)
+            if tag == TAG_SCREEN
+            else None
+        )
+        return Sequence(record, pages, kitty_image_storage, page_placements)
 
 
 def snapshot_structure(snapshot: Any) -> Structure:
@@ -287,6 +322,74 @@ def snapshot_structure(snapshot: Any) -> Structure:
         continuation=continuation,
         histories=histories,
     )
+
+
+def validate_kitty_pin(pin: Any, page: Any, label: str) -> None:
+    """Require a placement pin to name a cell of its page."""
+    header = page.payload.header
+    if pin.y >= header.rows or pin.x >= header.columns:
+        raise ValueError(f"{label}: pin outside its page")
+
+
+def validate_kitty(structure: Structure) -> None:
+    """Validate the Kitty graphics records: screen keys, image and frame
+    lengths, and that every pin names a cell of its page."""
+    for screen in structure.screens:
+        storage = screen.kitty_image_storage
+        if storage is None:
+            continue
+        payload = storage.payload
+        if payload.key != screen.record.payload.header.key:
+            raise ValueError("KITTY_IMAGE_STORAGE key differs from its SCREEN")
+
+        for image in payload.images:
+            if image.format.name not in KITTY_BPP:
+                raise ValueError(f"image {image.id}: stored as {image.format}")
+            expected = image.width * image.height * KITTY_BPP[image.format.name]
+            if image.data_length != expected:
+                raise ValueError(f"image {image.id}: data_length mismatch")
+            animation = getattr(image, "animation", None)
+            if animation is not None:
+                frame_length = image.width * image.height * 4
+                for frame in animation.frames:
+                    if frame.data_length != frame_length:
+                        raise ValueError(
+                            f"image {image.id}: frame data_length mismatch"
+                        )
+
+        for placement in payload.placements:
+            pin = getattr(placement, "pin", None)
+            if pin is None:
+                continue
+            if pin.page >= len(screen.pages):
+                raise ValueError(
+                    "KITTY_IMAGE_STORAGE pin names a missing page"
+                )
+            validate_kitty_pin(
+                pin,
+                screen.pages[pin.page],
+                "KITTY_IMAGE_STORAGE",
+            )
+
+    for sequence in structure.histories:
+        key = sequence.record.payload.key
+        for page, placements in zip(sequence.pages, sequence.page_placements):
+            if placements is None:
+                continue
+            if placements.payload.key != key:
+                raise ValueError(
+                    "KITTY_IMAGE_PAGE_PLACEMENTS key differs from HISTORY"
+                )
+            for placement in placements.payload.placements:
+                if placement.location.name == "virtual":
+                    raise ValueError("virtual placement in history")
+                pin = getattr(placement, "pin", None)
+                if pin is not None:
+                    validate_kitty_pin(
+                        pin,
+                        page,
+                        "KITTY_IMAGE_PAGE_PLACEMENTS",
+                    )
 
 
 def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
@@ -353,6 +456,8 @@ def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
                 f"{screen.record.payload.header.history_rows} "
                 f"does not match {history_rows}"
             )
+
+    validate_kitty(structure)
 
     for record in snapshot.records:
         payload = record.payload
@@ -485,3 +590,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

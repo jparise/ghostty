@@ -15,6 +15,11 @@ doc: |
   this schema. Each SCREEN declares its complete logical history extent before
   READY.
 
+  Optional Kitty graphics records carry each screen's images and placements:
+  KITTY_IMAGE_STORAGE right after a screen's SCREEN and PAGE records, and
+  KITTY_IMAGE_PAGE_PLACEMENTS right after a history PAGE that has placements
+  on it.
+
   A decoder skips every record whose tag it does not know, wherever it
   appears, after checking its length and CRC32C. This lets newer encoders
   add optional kinds of records without changing the format version.
@@ -41,6 +46,28 @@ enums:
     5: ready
     6: finish
     7: continuation
+    8: kitty_image_storage
+    10: kitty_image_page_placements
+  kitty_format:
+    0: rgb
+    1: rgba
+    2: png
+    3: gray_alpha
+    4: gray
+  kitty_compression:
+    0: none
+    1: zlib
+  kitty_animation_state:
+    0: stopped
+    1: loading
+    2: running
+  kitty_placement_tag:
+    0: internal
+    1: external
+  kitty_location:
+    0: pin
+    1: virtual
+    2: relative
   screen_key:
     0: primary
     1: alternate
@@ -186,6 +213,8 @@ types:
             2: screen_payload
             3: page_payload
             4: history_payload
+            8: kitty_image_storage_payload
+            10: kitty_image_page_placements_payload
 
   record_header_any:
     doc: |
@@ -1077,3 +1106,344 @@ types:
         type: u2
       - id: columns
         type: u2
+
+  kitty_image_storage_payload:
+    doc: |
+      One screen's Kitty graphics. It lists the images oldest first,
+      without their pixels. Then come the placements pinned to the screen's
+      SCREEN pages, its virtual placements, and the relative placements
+      positioned from either, each after its parent. Last is the chunked
+      transmission in progress, if there is one.
+    seq:
+      - id: key
+        type: u2
+        enum: screen_key
+        valid:
+          expr: _.to_i <= 1
+      - id: next_image_id
+        type: u4
+      - id: next_internal_placement_id
+        type: u4
+      - id: num_images
+        type: u4
+      - id: num_placements
+        type: u4
+      - id: loading_present
+        type: u1
+        valid:
+          max: 1
+      - id: images
+        type: kitty_image
+        repeat: expr
+        repeat-expr: num_images
+      - id: placements
+        type: kitty_placement(true)
+        repeat: expr
+        repeat-expr: num_placements
+      - id: loading
+        type: kitty_loading
+        if: loading_present == 1
+      - id: trailing_data
+        size-eos: true
+        valid:
+          expr: _.size == 0
+
+  kitty_image:
+    doc: |
+      data_length is width * height * bytes per pixel. Stored images are
+      never png.
+    seq:
+      - id: id
+        type: u4
+      - id: number
+        type: u4
+      - id: width
+        type: u4
+      - id: height
+        type: u4
+      - id: format
+        type: u1
+        enum: kitty_format
+      - id: flags
+        type: kitty_image_flags
+      - id: data_length
+        type: u8
+      - id: animation_present
+        type: u1
+        valid:
+          max: 1
+      - id: animation
+        type: kitty_animation
+        if: animation_present == 1
+
+  kitty_image_flags:
+    seq:
+      - id: raw
+        type: u1
+        valid:
+          expr: (_ & 0xfc) == 0
+    instances:
+      transient:
+        value: (raw & (1 << 0)) != 0
+      implicit_id:
+        value: (raw & (1 << 1)) != 0
+
+  kitty_animation:
+    doc: |
+      Frames after the root frame, which is the image itself. Each frame's
+      data_length is width * height * 4.
+    seq:
+      - id: state
+        type: u1
+        enum: kitty_animation_state
+      - id: max_loops
+        type: u4
+      - id: current_loop
+        type: u4
+      - id: current_index
+        type: u4
+      - id: root_gap_ms
+        type: u4
+      - id: frame_count
+        type: u4
+      - id: frames
+        type: kitty_animation_frame
+        repeat: expr
+        repeat-expr: frame_count
+
+  kitty_animation_frame:
+    seq:
+      - id: gap_ms
+        type: u4
+      - id: data_length
+        type: u8
+
+  kitty_placement:
+    params:
+      - id: in_storage
+        type: bool
+    seq:
+      - id: key
+        type: kitty_placement_key
+      - id: location
+        type: u1
+        enum: kitty_location
+      - id: pin
+        type: kitty_pin(in_storage)
+        if: location == kitty_location::pin
+      - id: relative
+        type: kitty_relative
+        if: location == kitty_location::relative
+      - id: x_offset
+        type: u4
+      - id: y_offset
+        type: u4
+      - id: source_x
+        type: u4
+      - id: source_y
+        type: u4
+      - id: source_width
+        type: u4
+      - id: source_height
+        type: u4
+      - id: columns
+        type: u4
+      - id: rows
+        type: u4
+      - id: z
+        type: s4
+
+  kitty_placement_key:
+    seq:
+      - id: image_id
+        type: u4
+      - id: tag
+        type: u1
+        enum: kitty_placement_tag
+      - id: id
+        type: u4
+
+  kitty_pin:
+    doc: |
+      In KITTY_IMAGE_STORAGE, the page index within the screen's SCREEN
+      sequence and the cell within it. In KITTY_IMAGE_PAGE_PLACEMENTS, the
+      cell within the preceding history PAGE.
+    params:
+      - id: in_storage
+        type: bool
+    seq:
+      - id: page
+        type: u2
+        if: in_storage
+      - id: y
+        type: u2
+      - id: x
+        type: u2
+
+  kitty_relative:
+    seq:
+      - id: parent
+        type: kitty_placement_key
+      - id: horizontal_offset
+        type: s4
+      - id: vertical_offset
+        type: s4
+
+  kitty_loading:
+    doc: A chunked transmission that was cut off between two chunks.
+    seq:
+      - id: id
+        type: u4
+      - id: number
+        type: u4
+      - id: width
+        type: u4
+      - id: height
+        type: u4
+      - id: format
+        type: u1
+        enum: kitty_format
+      - id: compression
+        type: u1
+        enum: kitty_compression
+      - id: flags
+        type: kitty_image_flags
+      - id: quiet
+        type: u1
+        valid:
+          max: 2
+      - id: response_id
+        type: u4
+      - id: response_image_number
+        type: u4
+      - id: response_placement_id
+        type: u4
+      - id: response_frame
+        type: u4
+      - id: display_present
+        type: u1
+        valid:
+          max: 1
+      - id: display
+        type: kitty_display
+        if: display_present == 1
+      - id: frame_present
+        type: u1
+        valid:
+          max: 1
+      - id: frame
+        type: kitty_frame_load
+        if: frame_present == 1
+      - id: len_data
+        type: u4
+      - id: data
+        size: len_data
+
+  kitty_display:
+    seq:
+      - id: image_id
+        type: u4
+      - id: image_number
+        type: u4
+      - id: placement_id
+        type: u4
+      - id: x
+        type: u4
+      - id: y
+        type: u4
+      - id: width
+        type: u4
+      - id: height
+        type: u4
+      - id: x_offset
+        type: u4
+      - id: y_offset
+        type: u4
+      - id: columns
+        type: u4
+      - id: rows
+        type: u4
+      - id: cursor_movement
+        type: u1
+        valid:
+          max: 1
+      - id: virtual_placement
+        type: u1
+      - id: parent_id
+        type: u4
+      - id: parent_placement_id
+        type: u4
+      - id: horizontal_offset
+        type: s4
+      - id: vertical_offset
+        type: s4
+      - id: z
+        type: s4
+
+  kitty_frame_load:
+    doc: The parameters of an animation frame transmission (a=f).
+    seq:
+      - id: format
+        type: u1
+        enum: kitty_format
+      - id: medium
+        type: u1
+        valid:
+          max: 3
+      - id: width
+        type: u4
+      - id: height
+        type: u4
+      - id: size
+        type: u4
+      - id: offset
+        type: u4
+      - id: image_id
+        type: u4
+      - id: image_number
+        type: u4
+      - id: placement_id
+        type: u4
+      - id: compression
+        type: u1
+        enum: kitty_compression
+      - id: more_chunks
+        type: u1
+      - id: usage
+        type: u4
+      - id: x
+        type: u4
+      - id: y
+        type: u4
+      - id: create_frame
+        type: u4
+      - id: edit_frame
+        type: u4
+      - id: gap_ms
+        type: s4
+      - id: composition_mode
+        type: u1
+        valid:
+          max: 1
+      - id: background
+        type: u4
+
+
+  kitty_image_page_placements_payload:
+    doc: Placements pinned to the preceding history PAGE, parents first.
+    seq:
+      - id: key
+        type: u2
+        enum: screen_key
+        valid:
+          expr: _.to_i <= 1
+      - id: num_placements
+        type: u4
+      - id: placements
+        type: kitty_placement(false)
+        repeat: expr
+        repeat-expr: num_placements
+      - id: trailing_data
+        size-eos: true
+        valid:
+          expr: _.size == 0

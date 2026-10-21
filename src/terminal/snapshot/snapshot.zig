@@ -9,6 +9,7 @@ const continuation = @import("continuation.zig");
 const envelope = @import("envelope.zig");
 const test_fixture = @import("fixture.zig");
 const history = @import("history.zig");
+const kitty = @import("kitty.zig");
 const page = @import("page.zig");
 const record = @import("record.zig");
 const screen = @import("screen.zig");
@@ -28,6 +29,7 @@ pub const Continuation = continuation.Value;
 pub const EncodeError = terminal.EncodeError ||
     screen.EncodeError ||
     history.EncodeError ||
+    kitty.EncodeError ||
     checkpoint.EncodeError ||
     continuation.EncodeError;
 
@@ -57,23 +59,43 @@ pub fn encode(
     var stream: record.Writer = .init(stack_alloc.allocator(), destination);
     defer stream.deinit();
 
+    // Plan each screen's Kitty graphics records up front. A screen without
+    // images has no plan and gets no Kitty graphics records at all.
+    var kitty_plans: std.EnumArray(TerminalScreenKey, ?kitty.Plan) = .initFill(null);
+    defer if (comptime build_options.kitty_graphics) {
+        for (&kitty_plans.values) |*plan| {
+            if (plan.*) |*p| p.deinit();
+        }
+    };
+    if (comptime build_options.kitty_graphics) {
+        for (std.enums.values(TerminalScreenKey)) |key| {
+            const s = t.screens.get(key) orelse continue;
+            kitty_plans.set(key, try kitty.ScreenPlan.init(
+                alloc,
+                s,
+                key,
+            ));
+        }
+    }
+
     // 1. Envelope
     try envelope.encode(stream.writer());
 
     // 2. Terminal
     try terminal.encode(t, &stream);
 
-    // 3. Primary and alt screen
-    try screen.encode(
-        t.screens.get(.primary).?,
-        .primary,
-        &stream,
-    );
-    if (t.screens.get(.alternate)) |alternate| try screen.encode(
-        alternate,
-        .alternate,
-        &stream,
-    );
+    // 3. Each screen, followed by its Kitty graphics images and
+    // placements. Screens may appear in any key order, so this visits
+    // every key and skips screens that don't exist.
+    for (std.enums.values(TerminalScreenKey)) |key| {
+        const s = t.screens.get(key) orelse continue;
+        try screen.encode(s, key, &stream);
+        if (comptime build_options.kitty_graphics) {
+            if (kitty_plans.getPtr(key).*) |*plan| {
+                try plan.encodeStorage(&stream);
+            }
+        }
+    }
 
     // 4. Standard Stream continuation.
     try continuation.encode(options.continuation, &stream);
@@ -81,17 +103,18 @@ pub fn encode(
     // 5. Ready marker.
     try checkpoint.encode(.ready, &stream);
 
-    // 6. History
-    try history.encode(
-        t.screens.get(.primary).?,
-        .primary,
-        &stream,
-    );
-    if (t.screens.get(.alternate)) |alternate| try history.encode(
-        alternate,
-        .alternate,
-        &stream,
-    );
+    // 6. Each screen's history, with the Kitty graphics placements pinned
+    // to each page.
+    for (std.enums.values(TerminalScreenKey)) |key| {
+        const s = t.screens.get(key) orelse continue;
+        const plan: ?*kitty.Plan = if (kitty_plans.getPtr(key).*) |*p| p else null;
+        try history.encode(
+            s,
+            key,
+            &stream,
+            plan,
+        );
+    }
 
     // 7. Finish
     try checkpoint.encode(.finish, &stream);
@@ -119,6 +142,16 @@ pub const DecodeOptions = struct {
     /// The snapshot format is unchanged, so this works with any snapshot.
     /// It has no effect on platforms that do not support compression.
     compress_history: bool = false,
+
+    /// The Kitty graphics image storage limit, in bytes, for each restored
+    /// screen, or null for the default limit of a new screen.
+    ///
+    /// The limit of the terminal that wrote the snapshot is not part of the
+    /// snapshot, so the decoder always applies this one. Images are restored
+    /// oldest first, and an image that does not fit evicts older images,
+    /// exactly as a live transmission would. The newest images are kept.
+    /// Zero disables Kitty graphics on the restored terminal.
+    kitty_image_storage_limit: ?usize = null,
 };
 
 /// One decoded Terminal and the bytes needed to resume its Stream.
@@ -263,6 +296,22 @@ pub const Decoder = struct {
 
         /// Options for each history page, taken from `ready`.
         page_options: history.DecodeOptions,
+
+        /// The Kitty graphics image storage generation of each screen at
+        /// READY. History placements only attach to images that were
+        /// restored at READY. See `kitty.PageTarget.ready_generation`.
+        kitty_generations: std.EnumMap(TerminalScreenKey, u64),
+
+        /// A record header already read from the source but not decoded yet.
+        /// After each history PAGE, the decoder reads the next header to see
+        /// whether that page's KITTY_IMAGE_PAGE_PLACEMENTS follows. If it is
+        /// some other record, its header waits here for the next call.
+        pending_header: ?record.Header = null,
+
+        /// An error from reading that next header. The page before it was
+        /// already applied, so the call that applied it still reports the
+        /// page, and the error is returned by the following call instead.
+        pending_error: ?record.NextHeaderError = null,
     };
 
     const Sequence = struct {
@@ -286,7 +335,8 @@ pub const Decoder = struct {
     }
 
     /// Errors possible while decoding the renderable prefix through READY.
-    pub const ReadyError = envelope.DecodeError ||
+    pub const ReadyError = kitty.DecodeError ||
+        envelope.DecodeError ||
         terminal.DecodeError ||
         screen.DecodeError ||
         continuation.DecodeError ||
@@ -305,6 +355,11 @@ pub const Decoder = struct {
     /// Terminal, its continuation, and the advisory history extents are all
     /// validated through READY. Scrollback history is not present yet and
     /// arrives through `next`. Asserts this is the first call.
+    ///
+    /// The Terminal also has every Kitty graphics image from the snapshot,
+    /// and the placements on its screens. Image pixels are not in the
+    /// snapshot yet, so the images are pending. Placements on history pages
+    /// arrive with their pages through `next`.
     pub fn ready(
         self: *Decoder,
         alloc: Allocator,
@@ -334,7 +389,7 @@ pub const Decoder = struct {
         // declared. Decode that many SCREEN sequences and route each one by
         // its encoded key.
         const screen_count = result.screens.all.count();
-        const screen_options: TerminalScreen.Options = options: {
+        var screen_options: TerminalScreen.Options = options: {
             const primary = result.screens.get(.primary).?;
             const explicit_bytes = primary.pages.limits.bytes.explicit;
             const explicit_lines = primary.pages.limits.lines.explicit;
@@ -351,28 +406,57 @@ pub const Decoder = struct {
                     explicit_lines,
             };
         };
+        if (options.kitty_image_storage_limit) |limit| {
+            screen_options.kitty_image_storage_limit = limit;
+        }
 
+        // Each SCREEN sequence may be followed by that screen's optional
+        // KITTY_IMAGE_STORAGE record. The header after it is read ahead to find
+        // out, so each loop starts with the next record's header in hand.
+        // The header left over at the end belongs to CONTINUATION.
         var routed: std.EnumSet(TerminalScreenKey) = .empty;
         var history_rows: std.EnumMap(TerminalScreenKey, u64) = .init(.{});
+        var header = try record.nextHeader(reader);
         for (0..screen_count) |_| {
-            var decoded = try screen.decode(
-                reader,
-                try record.nextHeader(reader),
-                io_,
-                alloc,
-                screen_options,
-            );
-            errdefer decoded.deinit();
+            // Decode the screen and move it into the slot for its key.
+            const key = key: {
+                var decoded = try screen.decode(
+                    reader,
+                    header,
+                    io_,
+                    alloc,
+                    screen_options,
+                );
+                errdefer decoded.deinit();
 
-            const slot = result.screens.get(decoded.key) orelse
-                return error.UnexpectedScreenKey;
-            if (routed.contains(decoded.key)) return error.DuplicateScreen;
-            routed.insert(decoded.key);
-            history_rows.put(decoded.key, decoded.history_rows);
+                const slot = result.screens.get(decoded.key) orelse
+                    return error.UnexpectedScreenKey;
+                if (routed.contains(decoded.key)) return error.DuplicateScreen;
+                routed.insert(decoded.key);
+                history_rows.put(decoded.key, decoded.history_rows);
 
-            slot.deinit();
-            slot.* = decoded.screen;
-            decoded.screen = undefined;
+                slot.deinit();
+                slot.* = decoded.screen;
+                decoded.screen = undefined;
+                break :key decoded.key;
+            };
+
+            // A KITTY_IMAGE_STORAGE record right after the screen holds its
+            // images and placements.
+            header = try record.nextHeader(reader);
+            if (comptime build_options.kitty_graphics) {
+                if (header.tag == .kitty_image_storage) {
+                    try kitty.decodeStorage(
+                        reader,
+                        header,
+                        io_,
+                        alloc,
+                        key,
+                        result.screens.get(key).?,
+                    );
+                    header = try record.nextHeader(reader);
+                }
+            }
         }
 
         // CONTINUATION is required after every active screen. Nonempty bytes
@@ -380,7 +464,7 @@ pub const Decoder = struct {
         const decoded_continuation = try continuation.decode(
             alloc,
             reader,
-            try record.nextHeader(reader),
+            header,
             options.max_continuation_bytes,
         );
         errdefer switch (decoded_continuation) {
@@ -396,11 +480,18 @@ pub const Decoder = struct {
         // that live terminal use destroys or replaces before their history
         // arrives.
         var generations: std.EnumMap(TerminalScreenKey, usize) = .init(.{});
+        var kitty_generations: std.EnumMap(TerminalScreenKey, u64) = .init(.{});
         var it = result.screens.all.iterator();
-        while (it.next()) |entry| generations.put(
-            entry.key,
-            result.screens.generation(entry.key),
-        );
+        while (it.next()) |entry| {
+            generations.put(
+                entry.key,
+                result.screens.generation(entry.key),
+            );
+            if (comptime build_options.kitty_graphics) kitty_generations.put(
+                entry.key,
+                entry.value.*.kitty_images.generation,
+            );
+        }
 
         self.state = .{ .history = .{
             .generations = generations,
@@ -409,6 +500,7 @@ pub const Decoder = struct {
             .current = null,
             .cols = result.cols,
             .page_options = .{ .compress = options.compress_history },
+            .kitty_generations = kitty_generations,
         } };
         return .{
             .terminal = result,
@@ -432,6 +524,7 @@ pub const Decoder = struct {
 
     /// Errors possible while decoding history records through FINISH.
     pub const NextError = record.NextHeaderError ||
+        kitty.DecodeError ||
         checkpoint.DecodeError ||
         history.Decoder.InitError ||
         page.DiscardError ||
@@ -482,6 +575,10 @@ pub const Decoder = struct {
     /// discarded too: later pages are older, and applying one above a gap
     /// would corrupt scrollback ordering. History for other screens is
     /// unaffected.
+    ///
+    /// The Kitty graphics placements pinned to a page are restored by the
+    /// same call as the page. When a page is dropped, its placements are
+    /// dropped too.
     pub fn next(
         self: *Decoder,
         alloc: Allocator,
@@ -509,7 +606,7 @@ pub const Decoder = struct {
 
             // Read the next header before deciding how to decode the
             // record. Unknown records before it were skipped.
-            const header = try record.nextHeader(self.source);
+            const header = try self.takeHeader();
 
             // All sequences are consumed: FINISH ends the snapshot, leaving
             // trailing transport bytes unread.
@@ -548,9 +645,23 @@ pub const Decoder = struct {
         }
     }
 
+    /// Return the next record header: the one a previous call read ahead,
+    /// or else the next one from the source. A failure from reading ahead
+    /// is returned here.
+    fn takeHeader(self: *Decoder) NextError!record.Header {
+        const state = &self.state.history;
+        if (state.pending_error) |err| return err;
+        if (state.pending_header) |header| {
+            state.pending_header = null;
+            return header;
+        }
+        return try record.nextHeader(self.source);
+    }
+
     /// Consume one PAGE record from the current sequence, applying it to
     /// the live terminal when it is still applicable and discarding it
-    /// otherwise.
+    /// otherwise. The page's Kitty graphics placements are restored with
+    /// it, or dropped with it.
     fn nextPage(
         self: *Decoder,
         alloc: Allocator,
@@ -575,14 +686,14 @@ pub const Decoder = struct {
         };
 
         sequence.remaining -= 1;
-        const header = try record.nextHeader(self.source);
-        const rows: usize = rows: {
+        const header = try self.takeHeader();
+        const applied: ?*TerminalScreen, const rows: usize = rows: {
             const restored = destination orelse {
                 // The record must still be consumed so decoding remains
                 // aligned with the following records and FINISH marker.
                 sequence.apply = false;
                 try page.discard(self.source, header);
-                break :rows 0;
+                break :rows .{ null, 0 };
             };
             // The one-shot history decoder rejects a Screen which already has
             // complete history. This incremental path intentionally bypasses
@@ -590,7 +701,7 @@ pub const Decoder = struct {
             // accumulated new history. Generation and width checks above keep
             // the destination compatible, while per-page finalization enforces
             // its current scrollback limits.
-            break :rows history.decodePage(
+            const rows = history.decodePage(
                 self.source,
                 header,
                 alloc,
@@ -603,19 +714,51 @@ pub const Decoder = struct {
                 // consumed, leaving the stream aligned on the next record.
                 error.MaxSizeExceeded,
                 error.MaxLinesExceeded,
-                => drop: {
+                => {
                     sequence.apply = false;
-                    break :drop 0;
+                    break :rows .{ null, 0 };
                 },
                 else => |other| return other,
             };
+            break :rows .{ restored, rows };
         };
 
-        return .{
+        const progress: Progress = .{
             .key = sequence.key,
             .rows = rows,
             .remaining = sequence.remaining,
         };
+
+        // The page's Kitty graphics placements, if any, follow it. Read the
+        // next header to find out. Anything else waits for the next call,
+        // and so does a failure to read it, because this page is already
+        // applied and its progress should not be lost.
+        const following = record.nextHeader(self.source) catch |err| {
+            state.pending_error = err;
+            return progress;
+        };
+        if (comptime build_options.kitty_graphics) {
+            if (following.tag == .kitty_image_page_placements) {
+                // The page was just added at the top of the screen, which
+                // makes it the first page of the screen's page list.
+                try kitty.decodePagePlacements(
+                    self.source,
+                    following,
+                    t.screens.active.io,
+                    alloc,
+                    sequence.key,
+                    if (applied) |s| .{
+                        .screen = s,
+                        .page = s.pages.pages.first.?,
+                        .ready_generation = state.kitty_generations.get(sequence.key).?,
+                    } else null,
+                );
+                return progress;
+            }
+        }
+
+        state.pending_header = following;
+        return progress;
     }
 };
 
@@ -927,8 +1070,9 @@ test "complete snapshot round trip with history and alternate screen" {
         t.screens.get(.alternate).?,
         .alternate,
         &reversed_stream,
+        null,
     );
-    try history.encode(primary, .primary, &reversed_stream);
+    try history.encode(primary, .primary, &reversed_stream, null);
     try checkpoint.encode(.finish, &reversed_stream);
 
     var reversed_source: std.Io.Reader = .fixed(reversed.written());
@@ -1436,7 +1580,7 @@ test "complete snapshot rejects ordering and invalid markers" {
     defer reordered_stream.deinit();
     try envelope.encode(reordered_stream.writer());
     try terminal.encode(&t, &reordered_stream);
-    try history.encode(primary, .primary, &reordered_stream);
+    try history.encode(primary, .primary, &reordered_stream, null);
     var reordered_source: std.Io.Reader = .fixed(reordered.written());
     try testing.expectError(
         error.UnexpectedRecordTag,
@@ -1514,7 +1658,7 @@ test "complete snapshot rejects ordering and invalid markers" {
     try screen.encode(primary, .primary, &undeclared_history_stream);
     try continuation.encode(.ground, &undeclared_history_stream);
     try checkpoint.encode(.ready, &undeclared_history_stream);
-    try history.encode(primary, .alternate, &undeclared_history_stream);
+    try history.encode(primary, .alternate, &undeclared_history_stream, null);
     var undeclared_history_source: std.Io.Reader = .fixed(
         undeclared_history.written(),
     );
@@ -1570,8 +1714,8 @@ test "complete snapshot rejects ordering and invalid markers" {
     );
     try continuation.encode(.ground, &duplicate_history_stream);
     try checkpoint.encode(.ready, &duplicate_history_stream);
-    try history.encode(primary, .primary, &duplicate_history_stream);
-    try history.encode(primary, .primary, &duplicate_history_stream);
+    try history.encode(primary, .primary, &duplicate_history_stream, null);
+    try history.encode(primary, .primary, &duplicate_history_stream, null);
     var duplicate_history_source: std.Io.Reader = .fixed(
         duplicate_history.written(),
     );
@@ -1993,7 +2137,7 @@ test "incremental decode discards history for screens changed since READY" {
             .getTopLeft(.screen).node.pageAssumeResident(),
         &stream,
     );
-    try history.encode(t.screens.get(.primary).?, .primary, &stream);
+    try history.encode(t.screens.get(.primary).?, .primary, &stream, null);
     try checkpoint.encode(.finish, &stream);
 
     // An unchanged declared screen accepts crafted history, establishing
